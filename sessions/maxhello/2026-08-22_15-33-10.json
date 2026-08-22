@@ -1,0 +1,18 @@
+{
+  "startedAt": 1787383990266,
+  "seconds": 15,
+  "scenario": "",
+  "owner": "maxhello",
+  "msgs": [
+    {
+      "text": "Hello."
+    },
+    {
+      "role": "me",
+      "text": "Your name?"
+    },
+    {
+      "text": "<expr"
+    }
+  ]
+}
