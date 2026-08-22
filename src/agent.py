@@ -7,8 +7,10 @@ from livekit.agents import (
     AgentServer,
     AgentSession,
     JobContext,
+    RunContext,
     TurnHandlingOptions,
     cli,
+    function_tool,
     inference,
     room_io,
 )
@@ -42,8 +44,9 @@ class Assistant(Agent):
 
                 - Your student is a true beginner. Speak EXTREMELY slowly and clearly.
                 - Use very short English sentences: 5 to 8 words maximum. One sentence at a time, then pause.
-                - Bilingual mode: after EVERY English sentence, immediately explain it in one short Chinese
-                  sentence, like "意思是,……". Then wait for the student.
+                - Speak ENGLISH by default. Only switch to Chinese when the student actually needs it:
+                  they say "what?" / "sorry?", ask in Chinese, stay silent and confused, or clearly did
+                  not understand. Then explain that one sentence in Chinese, and go back to English.
                 - Opening: first teach 3 key words for today's scenario one by one (bus, subway, ticket).
                   For each: say the English word twice, give the Chinese meaning, and have the student repeat it.
                 - Role-play scenario: you are a friendly local at a bus stop. The student wants to get to
@@ -53,6 +56,8 @@ class Assistant(Agent):
                   sentence, then its Chinese meaning.
                 - If the student gets stuck, give them a template of 3 to 4 words to repeat.
                 - Encourage a lot. Celebrate every answer, even wrong ones.
+                - When the student says goodbye (bye / goodbye / see you / 再见), say a short warm
+                  farewell like "Bye! Great job today!", then call the end_session tool to hang up.
 
                 # Output rules
 
@@ -87,22 +92,15 @@ class Assistant(Agent):
             ),
         )
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+    @function_tool
+    async def end_session(self, context: RunContext):
+        """End the tutoring session when the student says goodbye.
+
+        Only call this AFTER saying a short warm farewell (e.g. "Bye! Great job today!").
+        """
+
+        logger.info("student said goodbye, ending session")
+        context.session.shutdown()
 
 
 server = AgentServer()
@@ -124,7 +122,7 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=inference.TTS(
-            model="fishaudio/s2.1-pro", voice="fa4c9eb3dccc4806b382b40d61c6b10a"
+            model="fishaudio/s2.1-pro", voice="9a9cf47702da476aa4629e2506d4a857"  # Hannah,女声
         ),
         turn_handling=TurnHandlingOptions(
             # The LiveKit turn detector determines when the user is done speaking and the agent should respond.

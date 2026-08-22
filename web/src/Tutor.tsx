@@ -99,6 +99,13 @@ export default function Tutor() {
       els.forEach((el) => el.remove())
       setStatus('idle')
     })
+    // Emma 说再见主动挂断(session shutdown)后,页面跟着结束回到初始态
+    room.on(RoomEvent.ParticipantDisconnected, (p) => {
+      if (p.identity !== MY_IDENTITY) {
+        els.forEach((el) => el.remove())
+        setStatus('idle')
+      }
+    })
     try {
       await room.connect(LIVEKIT_URL, token)
       await room.localParticipant.setMicrophoneEnabled(true)
