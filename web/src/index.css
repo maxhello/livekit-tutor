@@ -1,0 +1,48 @@
+@import 'tailwindcss';
+
+/* 站点主题(与个人站同款 dark + cyan/violet) */
+body {
+  background: #030712;
+  color: #f3f4f6;
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'PingFang SC', 'Segoe UI', sans-serif;
+}
+
+.card {
+  border: 1px solid rgba(31, 41, 55, 0.8);
+  background: rgba(17, 24, 39, 0.5);
+  border-radius: 1rem;
+  backdrop-filter: blur(8px);
+}
+
+.heading-gradient {
+  background: linear-gradient(90deg, #22d3ee, #a78bfa);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.btn-primary {
+  background: linear-gradient(90deg, #06b6d4, #8b5cf6);
+  color: #fff;
+  border-radius: 0.75rem;
+  font-weight: 600;
+  transition: opacity 0.2s;
+}
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-ghost {
+  border: 1px solid rgba(31, 41, 55, 1);
+  color: #d1d5db;
+  border-radius: 0.75rem;
+  transition: background 0.2s;
+}
+.btn-ghost:hover {
+  background: rgba(31, 41, 55, 0.6);
+}
