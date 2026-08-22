@@ -6,23 +6,24 @@ import {
   type Participant,
   type TranscriptionSegment,
 } from 'livekit-client'
+import History, { appendSession } from './History'
+import { verifyCreds, type Account } from './github'
 
 const TOKEN_KEY = 'tutor-token'
-const HISTORY_KEY = 'tutor-history'
+/** GitHub 账号列表(写历史凭证)与当前登录者,存 localStorage */
+const ACCOUNTS_KEY = 'tutor-accounts'
+const CURRENT_KEY = 'tutor-current'
 /** LiveKit Cloud 项目地址(agent 部署于此) */
 const LIVEKIT_URL = 'wss://max-gkpnqhfq.livekit.cloud'
 /** 我方 participant identity(token 的 sub),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
-/** 历史上限(条),防 localStorage 膨胀 */
-const HISTORY_MAX = 50
+/** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
+const APP_VERSION = 'v2'
 
 type Status = 'idle' | 'connecting' | 'connected'
 
 /** 一条字幕:同 id 的流式片段会反复到达,聚合覆盖 */
-type Msg = { id: string; role: 'emma' | 'me'; text: string }
-
-/** 一次会话的存档:起止、时长、双方对话 */
-type Session = { id: number; startedAt: number; seconds: number; msgs: Msg[] }
+export type Msg = { id: string; role: 'emma' | 'me'; text: string }
 
 const fmt = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
@@ -59,6 +60,29 @@ export default function Tutor() {
   const [showTokenInput, setShowTokenInput] = useState(false)
   /** 今日练习场景(可选):连接后经 data channel 推给 Emma 直接入戏;留空则她语音问你 */
   const [scenario, setScenario] = useState('')
+  /** GitHub 多账号:本地存多套凭证,可切换;current 为 null 表示未登录 */
+  const [accounts, setAccounts] = useState<Account[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(ACCOUNTS_KEY) ?? '[]') as Account[]
+    } catch {
+      return []
+    }
+  })
+  const [current, setCurrent] = useState<Account | null>(() => {
+    try {
+      const list = JSON.parse(localStorage.getItem(ACCOUNTS_KEY) ?? '[]') as Account[]
+      return list.find((a) => a.user === localStorage.getItem(CURRENT_KEY)) ?? null
+    } catch {
+      return null
+    }
+  })
+  const [showLogin, setShowLogin] = useState(false)
+  const [ghUser, setGhUser] = useState('')
+  const [ghToken, setGhToken] = useState('')
+  const [loginErr, setLoginErr] = useState('')
+  const [verifying, setVerifying] = useState(false)
+  /** 通知 History 重读本地:新会话落盘时 +1 */
+  const [historyTick, setHistoryTick] = useState(0)
   const [status, setStatus] = useState<Status>('idle')
   const [error, setError] = useState('')
   const [seconds, setSeconds] = useState(0)
@@ -67,6 +91,11 @@ export default function Tutor() {
   const roomRef = useRef<Room | null>(null)
   const msgIndex = useRef(new Map<string, number>())
   const scrollRef = useRef<HTMLDivElement>(null)
+  /** 通话中状态快照:事件回调闭包读不到最新 state,走 ref */
+  const msgsRef = useRef<Msg[]>([])
+  const startedAtRef = useRef(0)
+  const scenarioRef = useRef('')
+  const endedRef = useRef(true)
 
   useEffect(() => {
     document.title = 'AI English Tutor'
@@ -85,9 +114,10 @@ export default function Tutor() {
     if (el) el.scrollTop = el.scrollHeight
   }, [msgs])
 
-  // 离开页面时挂断
+  // 离开页面时:先落盘本次会话再挂断
   useEffect(
     () => () => {
+      endSession()
       roomRef.current?.disconnect()
       roomRef.current = null
     },
@@ -109,8 +139,73 @@ export default function Tutor() {
           next[i] = { ...next[i], text: seg.text }
         }
       }
+      msgsRef.current = next
       return next
     })
+  }
+
+  /** 通话结束:字幕快照落 localStorage(为空不存),通知历史区刷新;endedRef 防挂断事件重复触发 */
+  function endSession() {
+    if (endedRef.current) return
+    endedRef.current = true
+    const startedAt = startedAtRef.current
+    const snapshot = msgsRef.current
+    if (!snapshot.length) return
+    const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000))
+    appendSession({
+      id: startedAt,
+      startedAt,
+      seconds,
+      scenario: scenarioRef.current,
+      msgs: snapshot,
+      synced: false,
+      owner: '',
+    })
+    setHistoryTick((t) => t + 1)
+  }
+
+  function switchAccount(a: Account) {
+    setCurrent(a)
+    localStorage.setItem(CURRENT_KEY, a.user)
+    setShowLogin(false)
+  }
+
+  function logout() {
+    setCurrent(null)
+    localStorage.removeItem(CURRENT_KEY)
+  }
+
+  function removeAccount(a: Account) {
+    setAccounts((prev) => {
+      const next = prev.filter((x) => x.user !== a.user)
+      localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(next))
+      return next
+    })
+    if (current?.user === a.user) logout()
+  }
+
+  /** 登录:校验 token 确属该账号,存入账号列表并设为当前 */
+  async function doLogin() {
+    const user = ghUser.trim()
+    const token = ghToken.trim()
+    if (!user || !token) return
+    setVerifying(true)
+    setLoginErr('')
+    try {
+      await verifyCreds(user, token)
+      setAccounts((prev) => {
+        const next = [...prev.filter((a) => a.user !== user), { user, token }]
+        localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(next))
+        return next
+      })
+      switchAccount({ user, token })
+      setGhUser('')
+      setGhToken('')
+    } catch (e) {
+      setLoginErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setVerifying(false)
+    }
   }
 
   async function start() {
@@ -139,6 +234,7 @@ export default function Tutor() {
       setSpeaking(sp ? (sp.identity === MY_IDENTITY ? 'me' : 'emma') : null)
     })
     room.on(RoomEvent.Disconnected, () => {
+      endSession()
       els.forEach((el) => el.remove())
       setSpeaking(null)
       setStatus('idle')
@@ -146,6 +242,7 @@ export default function Tutor() {
     // Emma 说再见主动挂断(session shutdown)后,页面跟着结束回到初始态
     room.on(RoomEvent.ParticipantDisconnected, (p) => {
       if (p.identity !== MY_IDENTITY) {
+        endSession()
         els.forEach((el) => el.remove())
         setSpeaking(null)
         setStatus('idle')
@@ -156,6 +253,10 @@ export default function Tutor() {
       await room.localParticipant.setMicrophoneEnabled(true)
       setMsgs([])
       msgIndex.current.clear()
+      msgsRef.current = []
+      startedAtRef.current = Date.now()
+      scenarioRef.current = scenario.trim()
+      endedRef.current = false
       setStatus('connected')
       // 有指定场景就推给 Emma(topic=scenario),她直接开场入戏
       if (scenario.trim()) {
@@ -177,6 +278,7 @@ export default function Tutor() {
   }
 
   function hangUp() {
+    endSession()
     roomRef.current?.disconnect()
   }
 
@@ -280,6 +382,9 @@ export default function Tutor() {
         </section>
       )}
 
+      {/* 练习历史:本地记录 + 登录后合并 GitHub 远端 */}
+      <History account={current} tick={historyTick} />
+
       {/* 玩法说明:折叠,不占注意力 */}
       <details className="card mt-4 p-4 text-sm text-gray-400 [&_summary]:cursor-pointer">
         <summary className="text-gray-300">How it works</summary>
@@ -290,13 +395,32 @@ export default function Tutor() {
         </ul>
       </details>
 
-      {/* footer:token 是低频配置,收成一行小字 */}
+      {/* footer:账号 / 房间 token / 版本,低频配置收成一行小字 */}
       <footer className="mt-6 flex flex-wrap items-center justify-center gap-3 text-xs text-gray-600">
+        {current ? (
+          <>
+            <span className="flex items-center gap-1.5">
+              <span className="size-1.5 rounded-full bg-cyan-500/70" />
+              <button onClick={() => setShowLogin(true)} className="hover:text-gray-300">
+                {current.user}
+              </button>
+            </span>
+            <span>·</span>
+            <button onClick={logout} className="hover:text-gray-300">
+              退出
+            </button>
+          </>
+        ) : (
+          <button onClick={() => setShowLogin(true)} className="hover:text-gray-300">
+            GitHub 登录(保存历史)
+          </button>
+        )}
+        {token && <span>·</span>}
         {token && !showTokenInput ? (
           <>
             <span className="flex items-center gap-1.5">
               <span className="size-1.5 rounded-full bg-emerald-500/70" />
-              access token saved
+              room token
             </span>
             <span>·</span>
             <button
@@ -307,13 +431,18 @@ export default function Tutor() {
             </button>
           </>
         ) : (
-          <button
-            onClick={() => token && setShowTokenInput(false)}
-            className={token ? 'text-gray-500 hover:text-gray-300' : 'hidden'}
-          >
-            {token ? 'cancel' : ''}
-          </button>
+          token && (
+            <button
+              onClick={() => setShowTokenInput(false)}
+              className="text-gray-500 hover:text-gray-300"
+            >
+              cancel
+            </button>
+          )
         )}
+        <span>·</span>
+        {/* 部署版本:改前端时把上面的 APP_VERSION +1 */}
+        <span>deploy {APP_VERSION}</span>
       </footer>
 
       {/* token 输入(首次 / 替换 / 出错时展开) */}
@@ -344,6 +473,77 @@ export default function Tutor() {
               </button>
             )}
           </div>
+        </div>
+      )}
+
+      {/* GitHub 账号卡(登录/多账号切换):写入历史的凭证 */}
+      {showLogin && (
+        <div className="card mt-3 space-y-3 p-4">
+          <h3 className="text-sm font-medium text-gray-300">GitHub 账号</h3>
+          {accounts.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {accounts.map((a) => (
+                <span
+                  key={a.user}
+                  className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs ${
+                    a.user === current?.user
+                      ? 'border-cyan-400/60 text-cyan-200'
+                      : 'border-gray-800 text-gray-400'
+                  }`}
+                >
+                  <button onClick={() => switchAccount(a)} className="hover:text-gray-200">
+                    {a.user}
+                    {a.user === current?.user ? ' ✓' : ''}
+                  </button>
+                  <button
+                    onClick={() => removeAccount(a)}
+                    className="text-gray-600 hover:text-rose-400"
+                    title="移除此账号"
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <input
+              value={ghUser}
+              onChange={(e) => setGhUser(e.target.value)}
+              placeholder="GitHub 用户名"
+              className="flex-1 rounded-lg border border-gray-800 bg-gray-900/70 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
+            />
+            <input
+              value={ghToken}
+              onChange={(e) => setGhToken(e.target.value)}
+              type="password"
+              placeholder="Access token(仅授权本仓库 Contents 读写)"
+              className="flex-1 rounded-lg border border-gray-800 bg-gray-900/70 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
+            />
+          </div>
+          {loginErr && <p className="text-xs text-rose-400/90">{loginErr}</p>}
+          <div className="flex gap-2">
+            <button
+              onClick={doLogin}
+              disabled={!ghUser.trim() || !ghToken.trim() || verifying}
+              className="btn-primary px-5 py-2 text-sm"
+            >
+              {verifying ? '验证中…' : '登录'}
+            </button>
+            <button
+              onClick={() => {
+                setShowLogin(false)
+                setLoginErr('')
+              }}
+              className="btn-ghost px-5 py-2 text-sm"
+            >
+              关闭
+            </button>
+          </div>
+          <p className="text-[11px] leading-relaxed text-gray-600">
+            登录后才能把练习记录保存到 GitHub(token
+            创建步骤见项目 README)。记录会提交到公开仓库,介意的内容请勿保存。
+          </p>
         </div>
       )}
     </div>
