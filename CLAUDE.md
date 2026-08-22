@@ -1,51 +1,49 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # AGENTS.md
 
-This is a LiveKit Agents project. LiveKit Agents is a Python SDK for building voice AI agents. This project is intended to be used with LiveKit Cloud. See @README.md for more about the rest of the LiveKit ecosystem.
+This is a LiveKit Agents project (Python SDK for voice AI agents), deployed to LiveKit Cloud. AI 英语口语陪练 "Emma":bilingual short-sentence conversation practice for a Chinese adult beginner (CEFR A1). Personal-use project.
 
-The following is a guide for working with this project.
+## Two components, zero backend
 
-## Project structure
+- `src/agent.py` — the voice agent (single file; keep `agent.py` as the entrypoint, see Dockerfile). Pipeline: STT `assemblyai/universal-3-5-pro` · LLM `google/gemma-4-31b-it` · TTS `fishaudio/s2.1-pro` (voice Hannah) — all via LiveKit Inference (`livekit.agents.inference`), so no third-party API keys. Uses the LiveKit turn detector with adaptive interruptions and preemptive generation, plus ai_coustics noise cancellation on input.
+- `web/` — React 19 + Vite + Tailwind 4 SPA using `livekit-client`. `web/src/Tutor.tsx` is the app shell (connection, transcript, GitHub accounts, session capture); `web/src/History.tsx` is the local history list / sync-to-GitHub / replay UI; `web/src/github.ts` wraps the Contents API used as zero-backend storage (`sessions/<user>/<timestamp>.json` in this repo). Deployed to GitHub Pages (subpath base `/livekit-tutor/`) via `.github/workflows/pages.yml` on pushes touching `web/**`.
 
-This Python project uses the `uv` package manager. You should always use `uv` to install dependencies, run the agent, and run tests.
+**Connection flow (no server of our own):** the browser connects directly to the LiveKit Cloud room with a long-lived token created via `lk token create --agent livekit-tutor` — the agent dispatch is embedded in the token, so Emma joins automatically. The token is the only credential; it lives in browser localStorage, never in the repo. Revoking = reissuing tokens under a new room name. If the user picks a practice scenario, the page publishes it on a data channel (`topic: "scenario"`); the agent's `data_received` handler has Emma open in-role. With no scenario, her instructions make her ask what to practice.
 
-All app-level code is in the `src/` directory. In general, simple agents can be constructed with a single `agent.py` file. Additional files can be added, but you must retain `agent.py` as the entrypoint (see the associated Dockerfile for how this is deployed).
+Identity convention: the human participant is always identity `max` (hardcoded in both `web/src/Tutor.tsx` and the token); transcript bubbles and speaking state are keyed off it.
 
-Be sure to maintain code formatting. You can use the ruff formatter/linter as needed: `uv run ruff format` and `uv run ruff check`.
+## Commands
+
+Python side uses `uv`; the web side uses npm.
+
+```bash
+lk agent dev            # run agent locally with hot reload
+lk agent deploy         # update the LiveKit Cloud deployment (after agent changes)
+
+# token for the web page (paste into the H5; long-lived)
+lk token create --join --room tutor-max --identity max --valid-for 8760h --agent livekit-tutor
+
+uv run ruff format      # format
+uv run ruff check       # lint
+uv run pytest           # tests (no tests/ directory yet; add one for agent behavior)
+
+cd web && npm run dev   # web dev server
+cd web && npm run build # tsc + vite build (what Pages CI runs)
+```
+
+Secrets (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET) live in `.env.local` (gitignored; `agent.py` loads it via `load_dotenv`). `livekit.toml` holds the LiveKit Cloud project subdomain and agent id used by `lk agent` commands.
 
 ## LiveKit Documentation
 
-LiveKit Agents is a fast-evolving project, and the documentation is updated frequently. You should always refer to the latest documentation when working with this project. For your convenience, LiveKit offers both a CLI and an MCP server that can be used to browse and search its documentation. If the developer has not yet installed the CLI, you should recommend that they install it.
+LiveKit Agents evolves fast — always check the latest docs rather than guessing APIs. The LiveKit CLI's `lk docs` subcommand gives full docs access from the terminal (CLI 2.15.0+, `brew install livekit-cli` on macOS). Key commands: `lk docs overview`, `lk docs search`, `lk docs get-page`, `lk docs changelog`. Prefer browsing over search, and search over `code-search` (docs pages are more current). An MCP server with the same access lives at `https://docs.livekit.io/mcp`. If you used these to search or browse, submit constructive feedback with `lk docs submit-feedback`.
 
-### LiveKit CLI
+## Agent design
 
-The [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/) `lk docs` subcommand gives full access to LiveKit documentation from the terminal. Requires CLI version 2.15.0+. Check with `lk --version`.
+Voice AI is latency-sensitive: keep irrelevant context and tools out of LLM requests. For multi-phase conversations, prefer LiveKit's handoffs/tasks (see https://docs.livekit.io/agents/build/workflows/) over one long instruction prompt.
 
-Install or update the CLI:
+When changing core agent behavior (instructions, tool descriptions, tasks/handoffs), don't guess what will work — write tests for the desired behavior first and iterate until they pass. See https://docs.livekit.io/agents/start/testing/.
 
-- **macOS:** `brew install livekit-cli` (update: `brew update && brew upgrade livekit-cli`)
-- **Linux:** `curl -sSL https://get.livekit.io/cli | bash`
-- **Windows:** `winget install LiveKit.LiveKitCLI` (update: `winget upgrade LiveKit.LiveKitCLI`)
-
-Run `lk docs --help` to see all available commands. Key commands: `lk docs overview`, `lk docs search`, `lk docs get-page`, `lk docs code-search`, `lk docs changelog`, `lk docs submit-feedback`. Run `lk docs <command> --help` before using a command for the first time, as the help text includes advice on usage and interpreting results. Prefer browsing (`overview`, `get-page`) over search, and prefer `search` over `code-search`, as docs pages are more up-to-date and provide better context than raw code.
-
-### LiveKit Docs MCP Server
-
-For deeper IDE integration, LiveKit also offers an [MCP server](https://docs.livekit.io/reference/developer-tools/docs-mcp/) with the same documentation access. It uses Streamable HTTP transport at `https://docs.livekit.io/mcp`. Refer to your IDE's documentation for how to add it.
-
-### Submit docs feedback to LiveKit
-
-If you use the LiveKit CLI or MCP Server to search or browse documentation, also submit constructive feedback to LiveKit with `lk docs submit-feedback` or the MCP `submit_docs_feedback` tool. Add this to your to-do list when planning work, to ensure you file feedback after completing your other tasks. Useful feedback includes incomplete documentation, broken examples, missing steps or any other documentation gap or issue.
-
-## Handoffs and tasks ("workflows")
-
-Voice AI agents are highly sensitive to excessive latency. For this reason, it's important to design complex agents in a structured manner that minimizes the amount of irrelevant context and unnecessary tools included in requests to the LLM. LiveKit Agents supports handoffs (one agent hands control to another) and tasks (tightly-scoped prompts to achieve a specific outcome) to support building reliable workflows. You should make use of these features, instead of writing long instruction prompts that cover multiple phases of a conversation.  Refer to the [documentation](https://docs.livekit.io/agents/build/workflows/) for more information.
-
-## Testing
-
-When possible, add tests for agent behavior. Read the [documentation](https://docs.livekit.io/agents/start/testing/), and refer to existing tests in the `tests/` directory.  Run tests with `uv run pytest`.
-
-Important: When modifying core agent behavior such as instructions, tool descriptions, and tasks/workflows/handoffs, never just guess what will work. Always use test-driven development (TDD) and begin by writing tests for the desired behavior. For instance, if you're planning to add a new tool, write one or more tests for the tool's behavior, then iterate on the tool until the tests pass correctly. This will ensure you are able to produce a working, reliable agent for the user.
-
-## LiveKit CLI
-
-Beyond documentation access, the LiveKit CLI (`lk`) supports other tasks such as managing SIP trunks for telephony-based agents. Run `lk --help` to explore available commands.
+Beyond docs access, the `lk` CLI also manages things like SIP trunks for telephony agents (`lk --help`).
