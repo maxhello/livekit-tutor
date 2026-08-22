@@ -46,3 +46,18 @@ body {
 .btn-ghost:hover {
   background: rgba(31, 41, 55, 0.6);
 }
+
+/* 通话声波:说话时柱子跳动 */
+@keyframes wave {
+  0%,
+  100% {
+    transform: scaleY(0.25);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+.wave-bar {
+  transform-origin: center;
+  animation: wave 0.9s ease-in-out infinite;
+}
