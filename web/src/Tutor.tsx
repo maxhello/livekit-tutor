@@ -8,15 +8,21 @@ import {
 } from 'livekit-client'
 
 const TOKEN_KEY = 'tutor-token'
+const HISTORY_KEY = 'tutor-history'
 /** LiveKit Cloud 项目地址(agent 部署于此) */
 const LIVEKIT_URL = 'wss://max-gkpnqhfq.livekit.cloud'
 /** 我方 participant identity(token 的 sub),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
+/** 历史上限(条),防 localStorage 膨胀 */
+const HISTORY_MAX = 50
 
 type Status = 'idle' | 'connecting' | 'connected'
 
 /** 一条字幕:同 id 的流式片段会反复到达,聚合覆盖 */
 type Msg = { id: string; role: 'emma' | 'me'; text: string }
+
+/** 一次会话的存档:起止、时长、双方对话 */
+type Session = { id: number; startedAt: number; seconds: number; msgs: Msg[] }
 
 const fmt = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
@@ -51,6 +57,8 @@ export default function Tutor() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) ?? '')
   const [draft, setDraft] = useState('')
   const [showTokenInput, setShowTokenInput] = useState(false)
+  /** 今日练习场景(可选):连接后经 data channel 推给 Emma 直接入戏;留空则她语音问你 */
+  const [scenario, setScenario] = useState('')
   const [status, setStatus] = useState<Status>('idle')
   const [error, setError] = useState('')
   const [seconds, setSeconds] = useState(0)
@@ -149,6 +157,13 @@ export default function Tutor() {
       setMsgs([])
       msgIndex.current.clear()
       setStatus('connected')
+      // 有指定场景就推给 Emma(topic=scenario),她直接开场入戏
+      if (scenario.trim()) {
+        await room.localParticipant.publishData(
+          new TextEncoder().encode(JSON.stringify({ scenario: scenario.trim() })),
+          { reliable: true, topic: 'scenario' },
+        )
+      }
     } catch (e) {
       els.forEach((el) => el.remove())
       setStatus('idle')
@@ -225,6 +240,12 @@ export default function Tutor() {
             <span className="text-sm text-gray-500">
               {token ? 'Emma is ready' : '需要先配置 access token ↓'}
             </span>
+            <input
+              value={scenario}
+              onChange={(e) => setScenario(e.target.value)}
+              placeholder="Scenario (optional) — e.g. ordering coffee · 留空则 Emma 语音问你"
+              className="w-72 rounded-full border border-gray-800 bg-gray-900/70 px-4 py-2 text-center text-xs text-gray-300 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
+            />
           </div>
         )}
         {error && (

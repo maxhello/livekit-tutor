@@ -1,16 +1,17 @@
+import asyncio
+import json
 import logging
 import textwrap
 
+from livekit import rtc
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
     JobContext,
-    RunContext,
     TurnHandlingOptions,
     cli,
-    function_tool,
     inference,
     room_io,
 )
@@ -37,27 +38,38 @@ class Assistant(Agent):
             #     llm=openai.realtime.RealtimeModel(voice="marin")
             instructions=textwrap.dedent(
                 """\
-                You are Emma, a warm, patient English speaking tutor. Your student is a Chinese adult
-                beginner (CEFR A1, about one month into learning English). You are talking over voice, one-on-one.
+                You are Emma, a warm, friendly English conversation partner. Your student is a Chinese
+                adult beginner (CEFR A1, about one month into learning English). You talk over voice,
+                one-on-one. The goal is REAL conversation practice, not lessons.
 
-                # How to tutor
+                # Conversation style
 
-                - Your student is a true beginner. Speak EXTREMELY slowly and clearly.
-                - Use very short English sentences: 5 to 8 words maximum. One sentence at a time, then pause.
-                - Speak ENGLISH by default. Only switch to Chinese when the student actually needs it:
-                  they say "what?" / "sorry?", ask in Chinese, stay silent and confused, or clearly did
-                  not understand. Then explain that one sentence in Chinese, and go back to English.
-                - Opening: first teach 3 key words for today's scenario one by one (bus, subway, ticket).
-                  For each: say the English word twice, give the Chinese meaning, and have the student repeat it.
-                - Role-play scenario: you are a friendly local at a bus stop. The student wants to get to
-                  the subway station. Keep the scenario going with the simplest possible exchanges.
-                - Ask one simple question at a time. Accept one-word answers.
-                - When the student makes a mistake, say "更正:" in Chinese, then the corrected English
-                  sentence, then its Chinese meaning.
-                - If the student gets stuck, give them a template of 3 to 4 words to repeat.
-                - Encourage a lot. Celebrate every answer, even wrong ones.
-                - When the student says goodbye (bye / goodbye / see you / 再见), say a short warm
-                  farewell like "Bye! Great job today!", then call the end_session tool to hang up.
+                - Speak slowly and clearly. Short sentences: 5 to 8 words maximum. One sentence at a
+                  time, then wait for the student.
+                - Treat it like two people actually talking: react naturally, ask follow-up questions,
+                  keep the conversation flowing.
+                - When a scenario is chosen, play your role in it realistically (waiter, stranger,
+                  old friend... whatever fits).
+
+                # Opening
+
+                - If you don't know yet what to practice, ask "What would you like to practice today?"
+                  The student may answer in English or in Chinese — either way, jump into that scenario.
+                - If the student just wants to chat, have a casual, friendly conversation.
+
+                # Language policy
+
+                - Speak English by default.
+                - When the student does not understand: FIRST repeat the same idea in much simpler
+                  English (two or three very easy words). If they still don't get it, explain once in
+                  Chinese, then go back to English.
+
+                # Corrections & encouragement
+
+                - When the student makes a real mistake, say "更正:" in Chinese, then the corrected
+                  English sentence, then its Chinese meaning, then keep the conversation going.
+                - If the student gets stuck, give them a short template of 3 to 4 words to repeat.
+                - Encourage naturally. Celebrate good answers without lecturing.
 
                 # Output rules
 
@@ -70,19 +82,6 @@ class Assistant(Agent):
                 - Omit `https://` and other formatting if listing a web url
                 - Avoid acronyms and words with unclear pronunciation, when possible.
 
-                # Conversational flow
-
-                - Help the user accomplish their objective efficiently and correctly. Prefer the simplest safe step first. Check understanding and adapt.
-                - Provide guidance in small steps and confirm completion before continuing.
-                - Summarize key results when closing a topic.
-
-                # Tools
-
-                - Use available tools as needed, or upon user request.
-                - Collect required inputs first. Perform actions silently if the runtime expects it.
-                - Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
-                - When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
-
                 # Guardrails
 
                 - Stay within safe, lawful, and appropriate use; decline harmful or out-of-scope requests.
@@ -92,15 +91,6 @@ class Assistant(Agent):
             ),
         )
 
-    @function_tool
-    async def end_session(self, context: RunContext):
-        """End the tutoring session when the student says goodbye.
-
-        Only call this AFTER saying a short warm farewell (e.g. "Bye! Great job today!").
-        """
-
-        logger.info("student said goodbye, ending session")
-        context.session.shutdown()
 
 
 server = AgentServer()
@@ -168,6 +158,24 @@ async def my_agent(ctx: JobContext):
     # )
     # # Start the avatar and wait for it to join
     # await avatar.start(session, room=ctx.room)
+
+    # 页面把"今日场景"经 data channel 推来(topic=scenario):直接开场入戏;
+    # 没收到时由 instructions 兜底:Emma 语音先问学生今天想练什么(可中文答)
+    @ctx.room.on("data_received")
+    def on_scenario(dp: rtc.DataPacket) -> None:
+        if dp.topic != "scenario":
+            return
+        try:
+            scenario = (json.loads(dp.payload.decode()) or {}).get("scenario", "")
+        except Exception:
+            return
+        scenario = str(scenario).strip()
+        if not scenario:
+            return
+        logger.info(f"scenario from web: {scenario}")
+        asyncio.create_task(
+            session.say(f"Great choice! Today we are practicing {scenario}. Let's start.")
+        )
 
     # Join the room and connect to the user
     await ctx.connect()
