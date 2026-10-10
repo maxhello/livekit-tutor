@@ -5,6 +5,7 @@ import os
 import textwrap
 import time
 from collections.abc import AsyncIterable
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -23,6 +24,9 @@ from livekit.agents import (
 )
 from livekit.agents.utils import is_given
 from livekit.plugins import ai_coustics
+
+if TYPE_CHECKING:
+    from livekit.plugins import simli
 
 # 纠错的纯逻辑(prompt/门控/解析)在独立模块,可单测不加载整个 agent
 from agent.corrections import (
@@ -213,6 +217,90 @@ server = AgentServer()
 # 场景播报等一次性后台任务:持引用防被 GC 中途回收
 _say_tasks: set[asyncio.Task] = set()
 
+# 头像后台重试任务:同样持引用
+_avatar_retry_tasks: set[asyncio.Task] = set()
+
+
+# --- Simli 头像启动:429 限流时自动重试 ---------------------------------------
+# 实测:断开后 Simli 会话几秒内释放;但上一个 job 的关闭流程要 5~20s,期间并发
+# 槽位仍被占用,立刻重连会被 /integrations/livekit/agents 以 429 拒绝——而插件
+# 对此不重试,失败即静默放弃(且此时 agent 自身音频已关,整场既无头像也无声)。
+# 这里包一层:每次尝试用全新 AvatarSession(失败的实例无法复用),重试前先等
+# /ratelimiter/sessions 归零,槽位空出再打。
+
+SIMLI_API_URL = "https://api.simli.ai"
+SIMLI_JOIN_TIMEOUT = 15.0  # 单次等 avatar 进房并出视频
+SIMLI_SLOT_WAIT_TIMEOUT = 60.0  # 重试前最多等槽位释放多久
+SIMLI_SLOT_POLL_INTERVAL = 3.0
+
+
+def _new_simli_avatar(simli_config) -> "simli.AvatarSession":
+    from livekit.plugins import simli
+
+    return simli.AvatarSession(simli_config=simli_config)
+
+
+async def _simli_slot_usage(api_key: str) -> int | None:
+    """当前占用的 Simli 并发会话数;探测失败返回 None(只影响日志,不影响重试)。"""
+    from livekit.agents.utils import http_context
+
+    try:
+        resp = await http_context.http_session().get(
+            f"{SIMLI_API_URL}/ratelimiter/sessions",
+            headers={"x-simli-api-key": api_key},
+        )
+        if resp.status == 200:
+            return (await resp.json()).get("currentUsage")
+        logger.warning(f"simli rate-limiter probe returned {resp.status}")
+    except Exception:
+        logger.warning("simli rate-limiter probe failed", exc_info=True)
+    return None
+
+
+async def _wait_for_simli_slot(api_key: str) -> None:
+    """等 Simli 并发槽位空出(旧 job 尚在关闭时会被占几秒到几十秒)。"""
+    deadline = time.monotonic() + SIMLI_SLOT_WAIT_TIMEOUT
+    while time.monotonic() < deadline:
+        usage = await _simli_slot_usage(api_key)
+        if usage == 0:
+            return
+        await asyncio.sleep(SIMLI_SLOT_POLL_INTERVAL)
+
+
+async def start_simli_avatar_with_retry(
+    session: AgentSession,
+    room: rtc.Room,
+    simli_config,
+    api_key: str,
+    *,
+    attempts: int,
+) -> "simli.AvatarSession | None":
+    """启动 Simli 头像,失败(429 限流/超时未进房)自动重试。
+
+    返回成功进房的 AvatarSession;全部失败返回 None。注意插件失败时不抛
+    异常,只提前 return——失败只能从 wait_for_join 超时上观察到。
+    """
+    for attempt in range(1, attempts + 1):
+        if not room.isconnected():
+            logger.info("simli avatar retry skipped: room disconnected")
+            return None
+        avatar = _new_simli_avatar(simli_config)
+        await avatar.start(session, room=room)
+        try:
+            await avatar.wait_for_join(timeout=SIMLI_JOIN_TIMEOUT)
+            if attempt > 1:
+                logger.info(f"simli avatar joined on attempt {attempt}/{attempts}")
+            return avatar
+        except (asyncio.TimeoutError, TimeoutError):
+            usage = await _simli_slot_usage(api_key)
+            logger.warning(
+                f"simli avatar attempt {attempt}/{attempts} did not join "
+                f"(rate-limiter usage={usage})"
+            )
+            if attempt < attempts:
+                await _wait_for_simli_slot(api_key)
+    return None
+
 
 @server.rtc_session(agent_name="livekit-tutor")
 async def my_agent(ctx: JobContext):
@@ -264,20 +352,25 @@ async def my_agent(ctx: JobContext):
     if use_simli:
         from livekit.plugins import simli
 
-        avatar = simli.AvatarSession(
-            simli_config=simli.SimliConfig(
-                api_key=simli_api_key,
-                face_id=simli_face_id,
-                max_session_length=3600,  # 练习一节课的量
-                max_idle_time=120,  # 思考间隙别太快掉线
-            ),
+        simli_config = simli.SimliConfig(
+            api_key=simli_api_key,
+            face_id=simli_face_id,
+            max_session_length=3600,  # 练习一节课的量
+            max_idle_time=120,  # 思考间隙别太快掉线
         )
-        # 按官方示例:先起 avatar,再 start 会话
-        await avatar.start(session, room=ctx.room)
-        try:
-            await avatar.wait_for_join(timeout=20)
-        except asyncio.TimeoutError:
-            logger.warning("simli avatar did not join in time; continuing without it")
+        # 先内联试一次(成功路径 <10s,不拖会话启动);撞上限流(重连太快/
+        # 旧会话未释放)则转后台等槽位空出再重试,重试成功头像中途接入
+        avatar = await start_simli_avatar_with_retry(
+            session, ctx.room, simli_config, simli_api_key, attempts=1
+        )
+        if avatar is None:
+            t = asyncio.create_task(
+                start_simli_avatar_with_retry(
+                    session, ctx.room, simli_config, simli_api_key, attempts=2
+                )
+            )
+            _avatar_retry_tasks.add(t)
+            t.add_done_callback(_avatar_retry_tasks.discard)
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
