@@ -1,0 +1,71 @@
+# 历史后端 API:镜像由 .github/workflows/server-image.yml 推到 GHCR
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tutor-api
+  namespace: tutor
+  labels: &labels
+    app: tutor-api
+    part-of: livekit-tutor
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # 单副本滚动会有新旧并发,直接重建更干净
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/maxhello/tutor-api:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tutor-secrets
+                  key: POSTGRES_PASSWORD
+            # $(VAR) 由 k8s 展开后拼接(引用同容器上面的 env)
+            - name: DATABASE_URL
+              value: postgresql+psycopg://tutor:$(POSTGRES_PASSWORD)@postgres:5432/tutor
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: tutor-secrets
+                  key: JWT_SECRET
+            - name: GITHUB_ALLOWLIST
+              valueFrom:
+                configMapKeyRef:
+                  name: tutor-config
+                  key: GITHUB_ALLOWLIST
+            - name: CORS_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: tutor-config
+                  key: CORS_ORIGINS
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: tutor
+  labels: *labels
+spec:
+  selector: *labels
+  ports:
+    - port: 8000

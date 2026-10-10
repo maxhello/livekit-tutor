@@ -1,0 +1,35 @@
+[project]
+name = "tutor-server"
+version = "1.0.0"
+description = "History backend for the livekit-tutor voice practice app"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy",
+    "pyjwt",
+    "httpx",
+    "psycopg[binary]",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+# 单文件应用(main.py),不作为包安装
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "A", "C4", "UP", "SIM", "RUF"]
+ignore = ["E501", "B008"]  # E501: 行长由 formatter 管;B008: FastAPI 的 Depends 默认值是官方写法
+allowed-confusables = ["ˈ", "ˌ"]  # IPA 重音符号,音标数据里合法
