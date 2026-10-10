@@ -1,28 +1,27 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   type Account,
-  type RemoteEntry,
-  getRemote,
-  listRemote,
+  type Correction,
+  getSession,
+  listSessions,
   putSession,
-  sessionPath,
-} from './github'
-import type { Msg } from './Tutor'
+} from './api'
+import { CorrectionItem, type Msg } from './Tutor'
 
 const HISTORY_KEY = 'tutor-history'
 /** 历史上限(条),防 localStorage 膨胀 */
 const HISTORY_MAX = 50
 
-/** 一次会话的存档:起止、时长、双方对话 + 持久化状态 */
+/** 一次会话的存档:起止、时长、双方对话、纠错卡 + 持久化状态 */
 export type Session = {
   id: number // = startedAt(ms),天然唯一
   startedAt: number
   seconds: number
   scenario: string
   msgs: Msg[]
-  synced: boolean
+  corrections?: Correction[]
+  synced: boolean // 已保存到后端
   owner: string // 同步时的 GitHub 用户名;未同步为 ''
-  path?: string // sessions/{owner}/xxx.json
 }
 
 export function loadSessions(): Session[] {
@@ -46,13 +45,6 @@ export function appendSession(s: Session): void {
   persistSessions([s, ...loadSessions()])
 }
 
-/** 文件名时间戳 → startedAt:sessions/用户/2026-08-22_10-32-07.json */
-function idFromPath(path: string): number {
-  const m = path.match(/(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})/)
-  if (!m) return 0
-  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime()
-}
-
 const pad = (n: number) => String(n).padStart(2, '0')
 const fmtDate = (ts: number) => {
   const d = new Date(ts)
@@ -60,20 +52,17 @@ const fmtDate = (ts: number) => {
 }
 const fmtDur = (s: number) => `${Math.floor(s / 60)}分${pad(s % 60)}秒`
 
-/** 远端会话文件的 JSON 结构(见 github.ts SessionPayload) */
-type RemoteSession = {
-  startedAt: number
-  seconds: number
-  scenario: string
-  owner?: string
-  msgs: { role: Msg['role']; text: string }[]
-}
-
 /**
- * 练习历史:列表 + 挑好的「保存」到 GitHub + 点开气泡回看。
+ * 练习历史:列表 + 挑好的「保存」到后端 + 点开气泡/纠错卡回看。
  * 本地(localStorage)为准;登录后合并远端独有记录 —— 换浏览器/设备登录同账号即可找回。
  */
-export default function History({ account, tick }: { account: Account | null; tick: number }) {
+export default function History({
+  account,
+  tick,
+}: {
+  account: Account | null
+  tick: number
+}) {
   const [sessions, setSessions] = useState<Session[]>(loadSessions)
   /** 账号筛选('' = 全部);默认当前账号 */
   const [filter, setFilter] = useState('')
@@ -97,27 +86,25 @@ export default function History({ account, tick }: { account: Account | null; ti
     setFilter(account?.user ?? '')
   }, [account?.user])
 
-  // 登录后合并远端:本机没有的已同步记录在此找回(public 仓库匿名可读)
+  // 登录后合并远端:本机没有的已同步记录在此找回
   useEffect(() => {
     if (!account) return
     let alive = true
-    listRemote(account.user, account.token)
-      .then((entries: RemoteEntry[]) => {
+    listSessions(account)
+      .then((summaries) => {
         if (!alive) return
         setSessions((prev) => {
           const haveIds = new Set(prev.map((s) => s.id))
-          const remotes = entries
-            .map((e) => ({ entry: e, id: idFromPath(e.path) }))
-            .filter(({ id }) => id && !haveIds.has(id))
-            .map(({ entry, id }) => ({
-              id,
-              startedAt: id,
-              seconds: 0,
-              scenario: '',
+          const remotes = summaries
+            .filter((r) => r.startedAt && !haveIds.has(r.startedAt))
+            .map((r) => ({
+              id: r.startedAt,
+              startedAt: r.startedAt,
+              seconds: r.seconds,
+              scenario: r.scenario,
               msgs: [] as Msg[],
               synced: true,
               owner: account.user,
-              path: entry.path,
             }))
           return remotes.length ? [...prev, ...remotes] : prev
         })
@@ -126,7 +113,7 @@ export default function History({ account, tick }: { account: Account | null; ti
     return () => {
       alive = false
     }
-  }, [account?.user, account?.token])
+  }, [account])
 
   const owners = useMemo(
     () => Array.from(new Set(sessions.map((s) => s.owner).filter(Boolean))),
@@ -141,21 +128,15 @@ export default function History({ account, tick }: { account: Account | null; ti
 
   async function syncOne(s: Session): Promise<void> {
     if (!account) throw new Error('请先在底部登录 GitHub 账号')
-    const path = s.path ?? sessionPath(account.user, s.startedAt)
-    await putSession(
-      account,
-      {
-        startedAt: s.startedAt,
-        seconds: s.seconds,
-        scenario: s.scenario,
-        owner: account.user,
-        msgs: s.msgs.map(({ role, text }) => ({ role, text })),
-      },
-      path,
-    )
+    await putSession(account, s.startedAt, {
+      seconds: s.seconds,
+      scenario: s.scenario,
+      msgs: s.msgs.map(({ role, text }) => ({ role, text })),
+      corrections: s.corrections ?? [],
+    })
     setSessions((prev) => {
       const next = prev.map((x) =>
-        x.id === s.id ? { ...x, synced: true, owner: account.user, path } : x,
+        x.id === s.id ? { ...x, synced: true, owner: account.user } : x,
       )
       persistSessions(next)
       return next
@@ -196,10 +177,10 @@ export default function History({ account, tick }: { account: Account | null; ti
     }
     setExpanded(key)
     // 远端占位条目:首次展开拉全文,并回写本地缓存(下次离线可看)
-    if (s.msgs.length === 0 && s.path) {
+    if (s.msgs.length === 0 && s.synced && account) {
       setLoadingOne(true)
       try {
-        const data = JSON.parse(await getRemote(s.owner, s.path)) as RemoteSession
+        const data = await getSession(account, s.id)
         setSessions((prev) => {
           const next = prev.map((x) =>
             x.id === s.id
@@ -207,12 +188,12 @@ export default function History({ account, tick }: { account: Account | null; ti
                   ...x,
                   seconds: data.seconds || x.seconds,
                   scenario: data.scenario || '',
-                  owner: data.owner || x.owner,
                   msgs: (data.msgs ?? []).map((m, i) => ({
-                    id: `${s.path}:${i}`,
+                    id: `${s.id}:${i}`,
                     role: m.role,
                     text: m.text,
                   })),
+                  corrections: data.corrections ?? [],
                 }
               : x,
           )
@@ -274,12 +255,18 @@ export default function History({ account, tick }: { account: Account | null; ti
               <div className="flex items-center gap-2 rounded-lg border border-gray-800/60 bg-gray-900/40 px-3 py-2 text-xs">
                 <button onClick={() => toggle(s)} className="flex flex-1 items-center gap-2 text-left">
                   <span className="shrink-0 text-gray-300">{fmtDate(s.startedAt)}</span>
-                  {(s.msgs.length > 0 || !s.synced) && (
-                    <span className="shrink-0 text-gray-500">{fmtDur(s.seconds)}</span>
-                  )}
+                  {s.seconds > 0 && <span className="shrink-0 text-gray-500">{fmtDur(s.seconds)}</span>}
                   <span className="min-w-0 flex-1 truncate text-gray-400">
-                    {s.scenario || (s.msgs.length > 0 ? '自由聊天' : '远端记录,点击加载')}
+                    {s.scenario || (s.msgs.length > 0 ? '自由聊天' : '云端记录,点击加载')}
                   </span>
+                  {(s.corrections?.length ?? 0) > 0 && (
+                    <span
+                      className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300"
+                      title="纠错卡数"
+                    >
+                      ✍ {s.corrections!.length}
+                    </span>
+                  )}
                   {owners.length > 1 && s.owner && (
                     <span className="shrink-0 rounded bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-400">
                       {s.owner}
@@ -287,7 +274,7 @@ export default function History({ account, tick }: { account: Account | null; ti
                   )}
                 </button>
                 {s.synced ? (
-                  <span className="shrink-0 text-emerald-500/80" title="已保存到 GitHub">
+                  <span className="shrink-0 text-emerald-500/80" title="已保存到云端">
                     ✓
                   </span>
                 ) : (
@@ -303,19 +290,28 @@ export default function History({ account, tick }: { account: Account | null; ti
                       {loadingOne ? '加载中…' : '暂无内容'}
                     </p>
                   ) : (
-                    s.msgs.map((m) => (
-                      <div key={m.id} className={m.role === 'me' ? 'text-right' : 'text-left'}>
-                        <span
-                          className={`inline-block max-w-[85%] rounded-xl px-3 py-1.5 text-sm ${
-                            m.role === 'me'
-                              ? 'bg-violet-500/15 text-violet-100'
-                              : 'bg-cyan-500/10 text-cyan-50'
-                          }`}
-                        >
-                          {m.text}
-                        </span>
-                      </div>
-                    ))
+                    <>
+                      {s.msgs.map((m) => (
+                        <div key={m.id} className={m.role === 'me' ? 'text-right' : 'text-left'}>
+                          <span
+                            className={`inline-block max-w-[85%] rounded-xl px-3 py-1.5 text-sm ${
+                              m.role === 'me'
+                                ? 'bg-violet-500/15 text-violet-100'
+                                : 'bg-cyan-500/10 text-cyan-50'
+                            }`}
+                          >
+                            {m.text}
+                          </span>
+                        </div>
+                      ))}
+                      {(s.corrections?.length ?? 0) > 0 && (
+                        <div className="mt-2 space-y-2 border-t border-gray-800/60 pt-2">
+                          {(s.corrections ?? []).map((c, i) => (
+                            <CorrectionItem key={i} c={c} />
+                          ))}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               )}

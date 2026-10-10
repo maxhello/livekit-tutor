@@ -7,7 +7,7 @@ import {
   type TranscriptionSegment,
 } from 'livekit-client'
 import History, { appendSession } from './History'
-import { verifyCreds, type Account } from './github'
+import { login as apiLogin, type Account, type Correction } from './api'
 
 const TOKEN_KEY = 'tutor-token'
 /** GitHub 账号列表(写历史凭证)与当前登录者,存 localStorage */
@@ -18,7 +18,7 @@ const LIVEKIT_URL = 'wss://max-gkpnqhfq.livekit.cloud'
 /** 我方 participant identity(token 的 sub),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v2'
+const APP_VERSION = 'v3'
 
 type Status = 'idle' | 'connecting' | 'connected'
 
@@ -27,6 +27,42 @@ export type Msg = { id: string; role: 'emma' | 'me'; text: string }
 
 const fmt = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+
+const KIND_LABEL: Record<string, string> = {
+  grammar: '语法',
+  word: '用词',
+  pronunciation: '发音',
+}
+
+/** 一张纠错卡:原句→正确句 + 中文讲解 + 发音重点词(悬停看技巧)。通话中实时出现,历史回放复用 */
+export function CorrectionItem({ c }: { c: Correction }) {
+  return (
+    <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
+          {KIND_LABEL[c.kind] ?? '纠错'}
+        </span>
+        <span className="text-gray-500 line-through decoration-gray-600">{c.original}</span>
+        <span className="text-gray-600">→</span>
+        <span className="font-medium text-cyan-200">{c.corrected}</span>
+      </div>
+      {c.point && <p className="mt-1 text-xs text-gray-400">{c.point}</p>}
+      {(c.words?.length ?? 0) > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {c.words.map((w, i) => (
+            <span
+              key={i}
+              className="rounded-lg bg-violet-500/10 px-2 py-0.5 text-xs text-violet-200"
+              title={w.tip_cn}
+            >
+              {w.word} <span className="text-violet-300/70">{w.ipa}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 /** 通话声波:5 根柱,说话时跳动 */
 function Wave({ active }: { active: boolean }) {
@@ -87,15 +123,33 @@ export default function Tutor() {
   const [error, setError] = useState('')
   const [seconds, setSeconds] = useState(0)
   const [msgs, setMsgs] = useState<Msg[]>([])
+  /** 实时错题本:agent 经 data channel(topic=correction)逐张推来 */
+  const [corrections, setCorrections] = useState<Correction[]>([])
   const [speaking, setSpeaking] = useState<'emma' | 'me' | null>(null)
+  /** 头像视频(Simli 开启时 agent 侧会发布视频轨) */
+  const [avatarVideo, setAvatarVideo] = useState(false)
   const roomRef = useRef<Room | null>(null)
   const msgIndex = useRef(new Map<string, number>())
   const scrollRef = useRef<HTMLDivElement>(null)
   /** 通话中状态快照:事件回调闭包读不到最新 state,走 ref */
   const msgsRef = useRef<Msg[]>([])
+  const correctionsRef = useRef<Correction[]>([])
   const startedAtRef = useRef(0)
   const scenarioRef = useRef('')
   const endedRef = useRef(true)
+  const videoElRef = useRef<HTMLVideoElement | null>(null)
+  /** 头像视频轨 attach 出的隐藏元素:srcObject 镜像给主舞台 <video> */
+  const avatarSrcElRef = useRef<HTMLMediaElement | null>(null)
+
+  // 头像 <video> 渲染出来后,把镜像轨的流接过去
+  useEffect(() => {
+    const src = avatarSrcElRef.current
+    const video = videoElRef.current
+    if (avatarVideo && src && video) {
+      video.srcObject = (src as HTMLVideoElement).srcObject
+      video.play().catch(() => {})
+    }
+  }, [avatarVideo])
 
   useEffect(() => {
     document.title = 'AI English Tutor'
@@ -158,6 +212,7 @@ export default function Tutor() {
       seconds,
       scenario: scenarioRef.current,
       msgs: snapshot,
+      corrections: correctionsRef.current,
       synced: false,
       owner: '',
     })
@@ -192,7 +247,7 @@ export default function Tutor() {
     setVerifying(true)
     setLoginErr('')
     try {
-      await verifyCreds(user, token)
+      await apiLogin(user, token) // 后端校验 PAT + 白名单,签发 JWT
       setAccounts((prev) => {
         const next = [...prev.filter((a) => a.user !== user), { user, token }]
         localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(next))
@@ -224,18 +279,49 @@ export default function Tutor() {
         el.style.display = 'none'
         document.body.appendChild(el)
         els.push(el)
+      } else if (track.kind === Track.Kind.Video) {
+        // Emma 的头像视频(Simli 开启时 avatar 代替 agent 发布音视频)
+        const el = track.attach()
+        el.style.display = 'none'
+        document.body.appendChild(el)
+        els.push(el)
+        avatarSrcElRef.current = el
+        setAvatarVideo(true)
       }
     })
     room.on(RoomEvent.TranscriptionReceived, (segments, participant) =>
       onTranscription(segments, participant?.identity),
     )
+    // agent 推来的纠错卡(topic=correction),进实时错题本
+    room.on(
+      RoomEvent.DataReceived,
+      (payload: Uint8Array, _p?: Participant, _k?: unknown, topic?: string) => {
+        if (topic !== 'correction') return
+        try {
+          const card = JSON.parse(new TextDecoder().decode(payload)) as Correction
+          if (!card.original || !card.corrected) return
+          setCorrections((prev) => {
+            const next = [...prev, card]
+            correctionsRef.current = next
+            return next
+          })
+        } catch {
+          // 坏卡直接丢弃,不影响通话
+        }
+      },
+    )
     room.on(RoomEvent.ActiveSpeakersChanged, (speakers: Participant[]) => {
       const sp = speakers.find((s) => s.audioLevel > 0.15)
       setSpeaking(sp ? (sp.identity === MY_IDENTITY ? 'me' : 'emma') : null)
     })
+    const cleanup = () => {
+      els.forEach((el) => el.remove())
+      avatarSrcElRef.current = null
+      setAvatarVideo(false)
+    }
     room.on(RoomEvent.Disconnected, () => {
       endSession()
-      els.forEach((el) => el.remove())
+      cleanup()
       setSpeaking(null)
       setStatus('idle')
     })
@@ -243,7 +329,7 @@ export default function Tutor() {
     room.on(RoomEvent.ParticipantDisconnected, (p) => {
       if (p.identity !== MY_IDENTITY) {
         endSession()
-        els.forEach((el) => el.remove())
+        cleanup()
         setSpeaking(null)
         setStatus('idle')
       }
@@ -252,8 +338,10 @@ export default function Tutor() {
       await room.connect(LIVEKIT_URL, token)
       await room.localParticipant.setMicrophoneEnabled(true)
       setMsgs([])
+      setCorrections([])
       msgIndex.current.clear()
       msgsRef.current = []
+      correctionsRef.current = []
       startedAtRef.current = Date.now()
       scenarioRef.current = scenario.trim()
       endedRef.current = false
@@ -307,9 +395,25 @@ export default function Tutor() {
       <main className="card mt-8 flex flex-1 flex-col items-center justify-center gap-6 p-10">
         {status === 'connected' ? (
           <>
-            <div className="heading-gradient text-5xl font-bold tabular-nums">
-              {fmt(seconds)}
-            </div>
+            {avatarVideo && (
+              <video
+                ref={videoElRef}
+                autoPlay
+                playsInline
+                muted /* 声音走音频轨,这里只放画面 */
+                className="aspect-video w-full max-w-sm rounded-2xl border border-gray-800 bg-black object-cover"
+              />
+            )}
+            {!avatarVideo && (
+              <div className="heading-gradient text-5xl font-bold tabular-nums">
+                {fmt(seconds)}
+              </div>
+            )}
+            {avatarVideo && (
+              <div className="text-2xl font-bold tabular-nums text-gray-300">
+                {fmt(seconds)}
+              </div>
+            )}
             <Wave active={speaking === 'emma'} />
             <div className="h-5 text-sm text-gray-400">
               {speaking === 'emma' ? (
@@ -382,7 +486,30 @@ export default function Tutor() {
         </section>
       )}
 
-      {/* 练习历史:本地记录 + 登录后合并 GitHub 远端 */}
+      {/* 实时错题本:agent 后台静默分析,卡片不打断对话 */}
+      {status === 'connected' && (
+        <section className="card mt-4 p-4">
+          <h2 className="mb-2 text-sm font-medium text-gray-300">
+            📝 错题本{' '}
+            <span className="text-xs font-normal text-gray-500">
+              说错的地方悄悄记在这里,不打断对话
+            </span>
+          </h2>
+          {corrections.length === 0 ? (
+            <p className="py-2 text-center text-sm text-gray-500">
+              还没有纠错卡 —— 大胆说,错了也没关系
+            </p>
+          ) : (
+            <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+              {corrections.map((c, i) => (
+                <CorrectionItem key={i} c={c} />
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* 练习历史:本地记录 + 登录后合并云端 */}
       <History account={current} tick={historyTick} />
 
       {/* 玩法说明:折叠,不占注意力 */}
