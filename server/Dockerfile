@@ -17,5 +17,7 @@ ARG UID=10001
 RUN adduser --disabled-password --gecos "" --home /app --shell /sbin/nologin --uid "${UID}" appuser
 USER appuser
 
-EXPOSE 8000
-CMD ["uv", "run", "--no-dev", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 运行时直接调 venv 里的 uvicorn:不再经过 uv(避免它往 /app/.cache 写缓存,
+# 那目录归 root,appuser 没有写权限)
+ENV PATH="/app/.venv/bin:$PATH"
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
