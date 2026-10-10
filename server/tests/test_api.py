@@ -19,7 +19,7 @@ def make_client(github_login: str = "maxhello", pat_ok: bool = True):
     main._github_login = (lambda pat: github_login) if pat_ok else (lambda pat: None)
     main.Base.metadata.drop_all(main.engine)
     main.Base.metadata.create_all(main.engine)
-    with TestClient(main.app) as client:
+    with TestClient(main.app, base_url="https://testserver") as client:  # https 让 secure cookie 可回传
         yield client
 
 
@@ -193,3 +193,63 @@ def test_livekit_token_contains_room_and_dispatch():
         assert payload["video"]["room"] == "tutor-max"
         assert payload["sub"] == "max"
         assert payload["roomConfig"]["agents"][0]["agentName"] == "livekit-tutor"
+
+
+# ---------------------------------------------------------------- GitHub OAuth
+
+
+def test_oauth_authorize_redirects_with_state():
+    with make_client() as c:
+        r = c.get("/api/auth/github", follow_redirects=False)
+        assert r.status_code in (302, 307)
+        assert r.headers["location"].startswith(
+            "https://github.com/login/oauth/authorize"
+        )
+        assert "client_id=test-client-id" in r.headers["location"]
+        assert "gh_state=" in r.headers["set-cookie"]
+
+
+def test_oauth_callback_rejects_bad_state():
+    with make_client() as c:
+        r = c.get("/api/auth/github/callback?code=x&state=evil", follow_redirects=False)
+        assert r.status_code == 400
+
+
+def test_oauth_callback_success_flow():
+    from urllib.parse import parse_qs, urlparse
+
+    import jwt as pyjwt
+
+    with make_client() as c:
+        r = c.get("/api/auth/github", follow_redirects=False)
+        state = parse_qs(urlparse(r.headers["location"]).query)["state"][0]
+
+        # mock 掉 GitHub 的两跳:code 换 token、token 查用户
+        main._exchange_code = lambda code: "gh-access-token"
+        main._github_login = lambda pat: "maxhello"
+
+        r = c.get(
+            f"/api/auth/github/callback?code=abc&state={state}", follow_redirects=False
+        )
+        assert r.status_code in (302, 307), r.text
+        loc = r.headers["location"]
+        assert loc.startswith("https://front.test/#gh=")
+        jwt_token = loc.split("#gh=")[1].split("&")[0]
+        payload = pyjwt.decode(
+            jwt_token, "test-secret-0123456789abcdef0123456789abcdef", algorithms=["HS256"]
+        )
+        assert payload["login"] == "maxhello"
+
+
+def test_oauth_callback_rejects_user_not_in_allowlist():
+    from urllib.parse import parse_qs, urlparse
+
+    with make_client() as c:
+        r = c.get("/api/auth/github", follow_redirects=False)
+        state = parse_qs(urlparse(r.headers["location"]).query)["state"][0]
+        main._exchange_code = lambda code: "gh-access-token"
+        main._github_login = lambda pat: "stranger"
+        r = c.get(
+            f"/api/auth/github/callback?code=abc&state={state}", follow_redirects=False
+        )
+        assert r.status_code == 403

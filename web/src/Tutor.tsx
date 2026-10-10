@@ -7,7 +7,14 @@ import {
   type TranscriptionSegment,
 } from 'livekit-client'
 import History, { appendSession } from './History'
-import { fetchRoomToken, login as apiLogin, type Account, type Correction } from './api'
+import {
+  consumeOAuthHash,
+  fetchRoomToken,
+  GITHUB_AUTH_URL,
+  saveApiToken,
+  type Account,
+  type Correction,
+} from './api'
 
 /** GitHub 账号列表(写历史凭证)与当前登录者,存 localStorage */
 const ACCOUNTS_KEY = 'tutor-accounts'
@@ -15,7 +22,7 @@ const CURRENT_KEY = 'tutor-current'
 /** 我方 participant identity(后端签 token 时写死),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v4'
+const APP_VERSION = 'v5'
 
 type Status = 'idle' | 'connecting' | 'connected'
 
@@ -90,14 +97,7 @@ function Wave({ active }: { active: boolean }) {
 export default function Tutor() {
   /** 今日练习场景(可选):连接后经 data channel 推给 Emma 直接入戏;留空则她语音问你 */
   const [scenario, setScenario] = useState('')
-  /** GitHub 多账号:本地存多套凭证,可切换;current 为 null 表示未登录 */
-  const [accounts, setAccounts] = useState<Account[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem(ACCOUNTS_KEY) ?? '[]') as Account[]
-    } catch {
-      return []
-    }
-  })
+  /** 当前登录账号(GitHub OAuth);null 表示未登录 */
   const [current, setCurrent] = useState<Account | null>(() => {
     try {
       const list = JSON.parse(localStorage.getItem(ACCOUNTS_KEY) ?? '[]') as Account[]
@@ -107,10 +107,6 @@ export default function Tutor() {
     }
   })
   const [showLogin, setShowLogin] = useState(false)
-  const [ghUser, setGhUser] = useState('')
-  const [ghToken, setGhToken] = useState('')
-  const [loginErr, setLoginErr] = useState('')
-  const [verifying, setVerifying] = useState(false)
   /** 通知 History 重读本地:新会话落盘时 +1 */
   const [historyTick, setHistoryTick] = useState(0)
   const [status, setStatus] = useState<Status>('idle')
@@ -147,6 +143,17 @@ export default function Tutor() {
 
   useEffect(() => {
     document.title = 'AI English Tutor'
+  }, [])
+
+  // OAuth 回跳:hash 里带 #gh=<jwt>&user=<login>,存下并设为当前账号(读完即清)
+  useEffect(() => {
+    const oauth = consumeOAuthHash()
+    if (!oauth) return
+    saveApiToken(oauth.user, oauth.token)
+    const account: Account = { user: oauth.user, token: '' }
+    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify([account]))
+    localStorage.setItem(CURRENT_KEY, oauth.user)
+    setCurrent(account)
   }, [])
 
   useEffect(() => {
@@ -213,48 +220,9 @@ export default function Tutor() {
     setHistoryTick((t) => t + 1)
   }
 
-  function switchAccount(a: Account) {
-    setCurrent(a)
-    localStorage.setItem(CURRENT_KEY, a.user)
-    setShowLogin(false)
-  }
-
   function logout() {
     setCurrent(null)
     localStorage.removeItem(CURRENT_KEY)
-  }
-
-  function removeAccount(a: Account) {
-    setAccounts((prev) => {
-      const next = prev.filter((x) => x.user !== a.user)
-      localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(next))
-      return next
-    })
-    if (current?.user === a.user) logout()
-  }
-
-  /** 登录:校验 token 确属该账号,存入账号列表并设为当前 */
-  async function doLogin() {
-    const user = ghUser.trim()
-    const token = ghToken.trim()
-    if (!user || !token) return
-    setVerifying(true)
-    setLoginErr('')
-    try {
-      await apiLogin(user, token) // 后端校验 PAT + 白名单,签发 JWT
-      setAccounts((prev) => {
-        const next = [...prev.filter((a) => a.user !== user), { user, token }]
-        localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(next))
-        return next
-      })
-      switchAccount({ user, token })
-      setGhUser('')
-      setGhToken('')
-    } catch (e) {
-      setLoginErr(e instanceof Error ? e.message : String(e))
-    } finally {
-      setVerifying(false)
-    }
   }
 
   async function start() {
@@ -529,74 +497,26 @@ export default function Tutor() {
         <span>deploy {APP_VERSION}</span>
       </footer>
 
-      {/* GitHub 账号卡(登录/多账号切换):写入历史的凭证 */}
+      {/* 登录卡:一键 GitHub OAuth,无需输入任何账号/token */}
       {showLogin && (
         <div className="card mt-3 space-y-3 p-4">
-          <h3 className="text-sm font-medium text-gray-300">GitHub 账号</h3>
-          {accounts.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              {accounts.map((a) => (
-                <span
-                  key={a.user}
-                  className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs ${
-                    a.user === current?.user
-                      ? 'border-cyan-400/60 text-cyan-200'
-                      : 'border-gray-800 text-gray-400'
-                  }`}
-                >
-                  <button onClick={() => switchAccount(a)} className="hover:text-gray-200">
-                    {a.user}
-                    {a.user === current?.user ? ' ✓' : ''}
-                  </button>
-                  <button
-                    onClick={() => removeAccount(a)}
-                    className="text-gray-600 hover:text-rose-400"
-                    title="移除此账号"
-                  >
-                    ✕
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <input
-              value={ghUser}
-              onChange={(e) => setGhUser(e.target.value)}
-              placeholder="GitHub 用户名"
-              className="flex-1 rounded-lg border border-gray-800 bg-gray-900/70 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
-            />
-            <input
-              value={ghToken}
-              onChange={(e) => setGhToken(e.target.value)}
-              type="password"
-              placeholder="Access token(只需验证身份,不用勾任何权限)"
-              className="flex-1 rounded-lg border border-gray-800 bg-gray-900/70 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
-            />
-          </div>
-          {loginErr && <p className="text-xs text-rose-400/90">{loginErr}</p>}
-          <div className="flex gap-2">
-            <button
-              onClick={doLogin}
-              disabled={!ghUser.trim() || !ghToken.trim() || verifying}
-              className="btn-primary px-5 py-2 text-sm"
-            >
-              {verifying ? '验证中…' : '登录'}
-            </button>
-            <button
-              onClick={() => {
-                setShowLogin(false)
-                setLoginErr('')
-              }}
-              className="btn-ghost px-5 py-2 text-sm"
-            >
+          <h3 className="text-sm font-medium text-gray-300">登录</h3>
+          <a
+            href={GITHUB_AUTH_URL}
+            className="btn-primary block px-5 py-2.5 text-center text-sm"
+          >
+            使用 GitHub 登录
+          </a>
+          <p className="text-[11px] leading-relaxed text-gray-600">
+            点击跳转 GitHub 授权页,点一下「Authorize」即可,无需输入账号或
+            token。只有白名单里的账号(服务器 GITHUB_ALLOWLIST)能登录;练习记录
+            保存在你自己的服务器上。
+          </p>
+          <div className="flex justify-end">
+            <button onClick={() => setShowLogin(false)} className="btn-ghost px-5 py-2 text-sm">
               关闭
             </button>
           </div>
-          <p className="text-[11px] leading-relaxed text-gray-600">
-            token 只用于验证身份(无需勾选任何权限):GitHub → Settings → Developer
-            settings → Personal access tokens 建 classic token 全不勾即可。练习记录保存在你自己的服务器上。
-          </p>
         </div>
       )}
     </div>

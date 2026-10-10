@@ -43,6 +43,23 @@ export type SessionDetail = SessionPayload & { startedAt: number }
 /** 每个账号的 JWT 分开存 */
 const tokenKey = (user: string) => `tutor-api-token:${user}`
 
+/** GitHub OAuth 一键登录入口(整页跳转;回来时 URL hash 带 #gh=<jwt>&user=<login>) */
+export const GITHUB_AUTH_URL = `${API_BASE}/api/auth/github`
+
+/** 保存某账号的后端 JWT(登录/续期后调用) */
+export function saveApiToken(user: string, token: string): void {
+  localStorage.setItem(tokenKey(user), token)
+}
+
+/** 读取并清掉 OAuth 回跳落在 hash 里的结果;没有则 null */
+export function consumeOAuthHash(): { user: string; token: string } | null {
+  const m = location.hash.match(/[#&]gh=([^&]+)&user=([^&]+)/)
+  if (!m) return null
+  const out = { token: decodeURIComponent(m[1]), user: decodeURIComponent(m[2]) }
+  history.replaceState(null, '', location.pathname + location.search)
+  return out
+}
+
 const errMsg = (status: number, text: string) => {
   if (status === 401) return 'GitHub token 无效,或与用户名不符'
   if (status === 403) return '该账号不在后端白名单里(服务器 GITHUB_ALLOWLIST)'
@@ -92,7 +109,14 @@ async function request(
     })
   let r = await doFetch(await getApiToken(account))
   if (r.status === 401) {
-    r = await doFetch(await login(account.user, account.token))
+    if (account.token) {
+      // PAT 账号:用 PAT 静默重签一次
+      r = await doFetch(await login(account.user, account.token))
+    } else {
+      // OAuth 账号:30 天 JWT 过期,重新走一次授权
+      window.location.href = GITHUB_AUTH_URL
+      throw new Error('登录已过期,正在重新跳转 GitHub 授权…')
+    }
   }
   return r
 }

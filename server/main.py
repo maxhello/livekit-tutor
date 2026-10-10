@@ -15,12 +15,16 @@
 
 import datetime
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlencode
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+import httpx
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from livekit import api as lk_api
 from livekit.protocol import agent_dispatch as lk_dispatch
 from livekit.protocol.room import RoomConfiguration
@@ -58,6 +62,12 @@ CALLER_IDENTITY = "max"
 CALLER_NAME = "Max"
 AGENT_NAME = "livekit-tutor"  # 对应 agent/ 里 @server.rtc_session(agent_name=...)
 ROOM_TOKEN_TTL = datetime.timedelta(hours=12)
+
+# GitHub OAuth 一键登录(创建 OAuth App 见 deploy/README.md)
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "").rstrip("/")  # 本服务对外地址(拼 callback)
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")  # 授权完跳回的前端地址
 
 
 @asynccontextmanager
@@ -158,6 +168,83 @@ def login(body: LoginBody, db: Session = Depends(get_db)) -> dict[str, str]:
         db.add(row)
         db.commit()
     return {"token": make_token(row), "user": row.github_login}
+
+
+# ---------------------------------------------------------------- GitHub OAuth 一键登录
+# 前端整页跳 /api/auth/github → GitHub 授权 → 回调换 token → 验白名单 →
+# 签我们的 JWT → 302 回前端,token 放 URL hash(#gh=...&user=...,hash 不上服务器日志)
+
+
+def _oauth_redirect_uri() -> str:
+    return f"{API_PUBLIC_URL}/api/auth/github/callback"
+
+
+@app.get("/api/auth/github")
+def github_auth() -> RedirectResponse:
+    if not (GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET and API_PUBLIC_URL and FRONTEND_URL):
+        raise HTTPException(500, "GitHub OAuth not configured")
+    state = secrets.token_urlsafe(16)
+    url = "https://github.com/login/oauth/authorize?" + urlencode(
+        {
+            "client_id": GITHUB_CLIENT_ID,
+            "redirect_uri": _oauth_redirect_uri(),
+            "scope": "read:user",
+            "state": state,
+        }
+    )
+    resp = RedirectResponse(url)
+    # state 存 HttpOnly cookie 防 CSRF;SameSite=Lax 在顶级跳转下仍会带上
+    resp.set_cookie(
+        "gh_state", state, max_age=600, httponly=True, samesite="lax", secure=True
+    )
+    return resp
+
+
+def _exchange_code(code: str) -> str | None:
+    """拿授权码换 GitHub access token;失败返回 None。"""
+    try:
+        r = httpx.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": _oauth_redirect_uri(),
+            },
+            timeout=10,
+        )
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    token = r.json().get("access_token")
+    return str(token) if token else None
+
+
+@app.get("/api/auth/github/callback")
+def github_callback(
+    code: str = "",
+    state: str = "",
+    gh_state: str | None = Cookie(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    if not code or not state or not gh_state:
+        raise HTTPException(400, "missing code/state")
+    if not secrets.compare_digest(state, gh_state):
+        raise HTTPException(400, "state mismatch")
+    access_token = _exchange_code(code)
+    login_name = _github_login(access_token) if access_token else None
+    if login_name is None or login_name.lower() not in GITHUB_ALLOWLIST:
+        raise HTTPException(403, "user not in allowlist")
+    row = db.scalar(select(UserRow).where(UserRow.github_login == login_name))
+    if row is None:
+        row = UserRow(github_login=login_name)
+        db.add(row)
+        db.commit()
+    resp = RedirectResponse(f"{FRONTEND_URL}/#gh={make_token(row)}&user={login_name}")
+    resp.delete_cookie("gh_state")
+    return resp
 
 
 def _session_out(s: SessionRow) -> dict[str, Any]:

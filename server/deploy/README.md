@@ -20,6 +20,19 @@ sslip.io 会把「任意前缀 + IP 横杠」解析到该 IP,所以**每个服�
    - ⚠️ 用 `ep-xxx` 直连端点,**不要**用 `-pooler` 端点(PgBouncer 事务模式与 psycopg 预编译语句有兼容坑)
 3. 免费版特性:空闲约 5 分钟自动挂起,下一请求冷启动约 0.5~1s(点「保存」时偶尔慢一下,正常)
 
+## GitHub OAuth App(一次性,一键登录用)
+
+1. 打开 **github.com/settings/developers** → OAuth Apps → **New OAuth App**
+   - Application name:随意(如 tutor)
+   - Homepage URL:`https://maxhello.github.io/livekit-tutor`
+   - Authorization callback URL(必须一字不差):
+     `https://tutor.161-118-202-85.sslip.io/api/auth/github/callback`
+2. 建好后把 **Client ID** 和 **Client secret**(Generate a new client secret)填进
+   `tutor-api.yaml` 的 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`,然后
+   `kubectl apply -f server/deploy/tutor-api.yaml`
+
+流程:页面点「使用 GitHub 登录」→ GitHub 点 Authorize → 自动回来,无需输入任何账号/token。
+
 ## 首次部署(一次性)
 
 ```bash
@@ -84,6 +97,15 @@ spec:
               value: "<API key>"
             - name: LIVEKIT_API_SECRET
               value: "<API secret>"
+            # GitHub OAuth(建 App 步骤见上面的「GitHub OAuth App」一节)
+            - name: GITHUB_CLIENT_ID
+              value: "<OAuth App Client ID>"
+            - name: GITHUB_CLIENT_SECRET
+              value: "<OAuth App Client secret>"
+            - name: API_PUBLIC_URL
+              value: "https://tutor.161-118-202-85.sslip.io"
+            - name: FRONTEND_URL
+              value: "https://maxhello.github.io/livekit-tutor"
             - name: GITHUB_ALLOWLIST
               value: "maxhello"
             - name: CORS_ORIGINS

@@ -23,14 +23,15 @@ LiveKit 密钥只在服务器上,浏览器不再保存任何长期凭证——�
 
 > 手动调试仍可 `lk token create --join --room tutor-max --identity max --agent livekit-tutor`。
 
-## 练习历史(GitHub 登录 → 自己的后端)
+## 练习历史(GitHub 一键登录 → 自己的后端)
 
 练完的对话先存浏览器 localStorage;在页面"练习历史"里挑好的点「保存」,
 会上传到自己后端(数据库用 Neon 免费 PostgreSQL)。换浏览器/设备登录同一账号即可找回;
-不登录也能练,只是不能上传。
+不登录不能练(token 也由后端签发)。
 
-- 登录仍是 GitHub 账号:页面把 PAT 发给后端,后端调 GitHub API 校验并按
-  白名单(`GITHUB_ALLOWLIST`,见 `server/deploy/config.yaml`)放行,签发 30 天 JWT
+- 登录是 **GitHub OAuth 一键授权**(跳转 GitHub 点一下 Authorize,无需输入账号/token);
+  白名单(`GITHUB_ALLOWLIST`)外的账号会被拒。首次需建一个 OAuth App,见
+  `server/deploy/README.md` 的「GitHub OAuth App」一节
 - 后端地址在 `web/src/api.ts` 的 `API_BASE`(sslip.io 域名,见 `server/deploy/README.md`)
 - 服务器部署/更新/备份:`server/deploy/README.md`
 
