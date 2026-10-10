@@ -25,7 +25,7 @@ class UserRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     github_login: Mapped[str] = mapped_column(unique=True, index=True)
-    created_at: Mapped[int] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
 class SessionRow(Base):
@@ -37,7 +37,7 @@ class SessionRow(Base):
     started_at: Mapped[int]  # 会话开始时间,毫秒时间戳(前端用作 id)
     seconds: Mapped[int] = mapped_column(default=0)
     scenario: Mapped[str] = mapped_column(default="")
-    created_at: Mapped[int] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
     messages: Mapped[list["MessageRow"]] = relationship(
         back_populates="session",
