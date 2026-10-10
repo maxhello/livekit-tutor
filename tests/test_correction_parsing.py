@@ -1,6 +1,6 @@
 """纠错纯函数测试:门控、解析、prompt 组装。不碰网络与 SDK 会话。"""
 
-from agent.agent import (
+from agent.corrections import (
     CORRECTION_SYSTEM_PROMPT,
     build_analyzer_messages,
     parse_correction_card,

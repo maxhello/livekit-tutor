@@ -10,7 +10,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev
 
-COPY main.py ./
+COPY main.py models.py auth.py ./
 
 # 非 root 运行
 ARG UID=10001
