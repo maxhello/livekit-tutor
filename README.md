@@ -10,7 +10,7 @@ agent/   Voice agent(LiveKit Agents Python),部署在 LiveKit Cloud
          全部走 LiveKit Inference 托管推理,无需第三方 API key
          实时纠错:每轮说完后台小模型分析,纠错卡推到页面错题本
          Simli 真人头像(可选):配置 SIMLI_API_KEY/SIMLI_FACE_ID 即启用
-server/  历史后端(FastAPI + PostgreSQL),部署在自己的 k3s 服务器
+server/  历史后端(FastAPI + Neon 免费 PostgreSQL),部署在自己的 k3s 服务器
          部署见 server/deploy/README.md;GitHub 登录沿用,后端校验+白名单
 ```
 
@@ -28,7 +28,7 @@ lk token create --join --room tutor-max --identity max --valid-for 8760h --agent
 ## 练习历史(GitHub 登录 → 自己的后端)
 
 练完的对话先存浏览器 localStorage;在页面"练习历史"里挑好的点「保存」,
-会上传到自己服务器上的 PostgreSQL。换浏览器/设备登录同一账号即可找回;
+会上传到自己后端(数据库用 Neon 免费 PostgreSQL)。换浏览器/设备登录同一账号即可找回;
 不登录也能练,只是不能上传。
 
 - 登录仍是 GitHub 账号:页面把 PAT 发给后端,后端调 GitHub API 校验并按

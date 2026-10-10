@@ -6,7 +6,7 @@
  */
 
 /** 后端地址:k3s Traefik 入口的 HTTPS 域名。sslip.io 规则:IP 1.2.3.4 → 1-2-3-4.sslip.io */
-export const API_BASE = 'https://203-0-113-10.sslip.io' // TODO 部署后替换成你的域名
+export const API_BASE = 'https://tutor.161-118-202-85.sslip.io' // 本服务的 sslip.io 子域名(每服务一个,见 server/deploy/ingress.yaml)
 
 /** GitHub 账号:token 是 PAT(用于向后端换取/续期 JWT) */
 export type Account = { user: string; token: string }

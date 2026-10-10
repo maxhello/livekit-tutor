@@ -1,45 +1,113 @@
 # 后端部署(k3s)
 
-三部分:PostgreSQL(StatefulSet + local-path PVC)· API(GHCR 镜像)· 入口(自带 Traefik + cert-manager 自动 HTTPS)。
+三部分:API(GHCR 镜像)· 入口(自带 Traefik + cert-manager 自动 HTTPS)· 数据库(Neon 免费 serverless PostgreSQL,不在集群里)。
 
-## 域名(sslip.io,零成本)
+域名已定:本服务用 `tutor.161-118-202-85.sslip.io`(ingress.yaml 和 web/src/api.ts 都已填好)。
+sslip.io 会把「任意前缀 + IP 横杠」解析到该 IP,所以**每个服务一个子域名**(以后第二个服务用
+`xxx.161-118-202-85.sslip.io`,新建一个 Ingress 即可,互不干扰)。
+邮箱已填,**清单里没有要改的了**。
 
-公网 IP `1.2.3.4` 对应域名 `1-2-3-4.sslip.io`(横杠代替点)。Let's Encrypt 可以为它签正式证书,浏览器信任。
+> 国内服务器注意:未备案域名走 80/443 可能被拦。先 `curl http://161.118.202.85` 验证;不行就把 Ingress 挂到非标端口(8080/8443)或改用 Cloudflare Tunnel。
 
-改两处后 apply:
+## 数据库:Neon(一次性)
 
-1. `ingress.yaml` 里两处 `203-0-113-10.sslip.io` → 你的 `<IP横杠>.sslip.io`,`email` 换成你的邮箱
-2. 前端 `web/src/api.ts` 的 `API_BASE` 同步改
-
-> 国内服务器注意:未备案域名走 80/443 可能被拦。先 `curl http://<ip>` 验证;不行就把 Ingress 挂到非标端口(8080/8443)或改用 Cloudflare Tunnel。
+1. 注册 [neon.tech](https://neon.tech)(免费),建一个 project
+   - Region 选离 k3s 服务器最近的(如新加坡 ap-southeast-1 / 东京 ap-northeast-1)
+2. 控制台复制 **直连** Connection string(形如
+   `postgresql://user:pass@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require`),
+   改造成后端格式:驱动前缀加 `+psycopg`:
+   `postgresql+psycopg://user:pass@ep-xxx....neon.tech/neondb?sslmode=require`
+   - ⚠️ 用 `ep-xxx` 直连端点,**不要**用 `-pooler` 端点(PgBouncer 事务模式与 psycopg 预编译语句有兼容坑)
+3. 免费版特性:空闲约 5 分钟自动挂起,下一请求冷启动约 0.5~1s(点「保存」时偶尔慢一下,正常)
 
 ## 首次部署(一次性)
 
 ```bash
-# 1) cert-manager(集群级,只需一次)
+# 1) cert-manager(集群级,只需一次;它是 sslip.io 能有正式证书的关键)
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
 kubectl -n cert-manager rollout status deploy/cert-manager
 
-# 2) 真实密钥(只存在集群里,绝不进仓库)
-kubectl create namespace tutor
-kubectl -n tutor create secret generic tutor-secrets \
-  --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 16)" \
-  --from-literal=JWT_SECRET="$(openssl rand -hex 32)"
+# 2) 通用命名空间,手动建一次,以后所有服务共用(不再一服务一空间)
+kubectl create namespace max
 
-# 3) 应用全部清单
+# 3) 建 tutor-api.yaml(含明文密钥,已 gitignore 不进仓库,clone 后没有它;
+#    照下方模板抄,填上 Neon 连接串)
+vim server/deploy/tutor-api.yaml
+
+# 4) 应用全部清单
 kubectl apply -f server/deploy/
 
-# 4) 看状态:pod 就绪、证书签发完成(Takes ~1min)
-kubectl -n tutor get pods
-kubectl -n tutor get certificate   # READY True 即证书就绪
+# 5) 看状态:pod 就绪、证书签发完成(Takes ~1min)
+kubectl -n max get pods
+kubectl -n max get certificate   # READY True 即证书就绪
+```
+
+### tutor-api.yaml 模板(整个文件,照抄后只改 DATABASE_URL 和 JWT_SECRET)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tutor-api
+  namespace: max
+  labels: &labels
+    app: tutor-api
+    part-of: livekit-tutor
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: tutor-api
+          image: ghcr.io/maxhello/tutor-api:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://USER:PASS@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+            - name: JWT_SECRET
+              value: "<openssl rand -hex 32 生成>"
+            - name: GITHUB_ALLOWLIST
+              value: "maxhello"
+            - name: CORS_ORIGINS
+              value: "https://maxhello.github.io,http://localhost:5173"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tutor-api
+  namespace: max
+  labels: *labels
+spec:
+  selector: *labels
+  ports:
+    - port: 8000
 ```
 
 GHCR 镜像默认私有;最省事的做法:在 GitHub → Packages → tutor-api → Settings 设为 **public**(镜像里没有数据),就不用配 imagePullSecret。想保持私有则:
 
 ```bash
-kubectl -n tutor create secret docker-registry regcred \
+kubectl -n max create secret docker-registry regcred \
   --docker-server=ghcr.io --docker-username=maxhello --docker-password=<GitHub PAT(write:packages)>
-# 然后在 api.yaml 的 spec.template.spec 加 imagePullSecrets: [{name: regcred}]
+# 然后在 tutor-api.yaml 的 spec.template.spec 加 imagePullSecrets: [{name: regcred}]
 ```
 
 ## 日常更新
@@ -47,17 +115,17 @@ kubectl -n tutor create secret docker-registry regcred \
 push 到 main(触碰 `server/**`)会自动构建新镜像推 GHCR(见 `.github/workflows/server-image.yml`),然后在服务器上:
 
 ```bash
-kubectl -n tutor rollout restart deploy/tutor-api
+kubectl -n max rollout restart deploy/tutor-api
 ```
 
-改配置(白名单/CORS):改 `config.yaml` 后 `kubectl apply -f server/deploy/config.yaml && kubectl -n tutor rollout restart deploy/tutor-api`。
-
-改密钥:`kubectl -n tutor delete secret tutor-secrets` 后按上面命令重建,再 restart。
+改配置(白名单/CORS/密钥):都在 `tutor-api.yaml` 的 env 里;改完
+`kubectl apply -f server/deploy/tutor-api.yaml` 即可(滚动重建,不用再 rollout restart)。
 
 ## 备份
 
-数据都在 PG 里:
+数据在 Neon:控制台自带快照/恢复(免费版保留期有限),重要节点可再导一份:
 
 ```bash
-kubectl -n tutor exec postgres-0 -- pg_dump -U tutor tutor | gzip > tutor-$(date +%F).sql.gz
+# 本机装 psql 即可,不依赖集群
+pg_dump "<Neon 控制台复制的连接串>" | gzip > tutor-$(date +%F).sql.gz
 ```
