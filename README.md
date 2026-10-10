@@ -38,7 +38,7 @@ LiveKit 密钥只在服务器上,浏览器不再保存任何长期凭证——�
 ## 常用命令
 
 ```bash
-lk agent dev agent/agent.py   # 本地开发 agent(改动热重载)
+lk agent dev agent/main.py   # 本地开发 agent(改动热重载)
 lk agent deploy               # 更新云端部署(改 agent 后跑这个)
 cd web && npm run dev         # 本地开发页面
 cd server && uv run pytest    # 后端测试

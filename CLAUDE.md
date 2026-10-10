@@ -8,7 +8,7 @@ AI 英语口语陪练 "Emma":bilingual short-sentence conversation practice for 
 
 ## Three parts, each deployed separately
 
-- `agent/` — the voice agent. Entrypoint `agent/agent.py` (Dockerfile CMD); pure correction logic (analyzer prompt, gating, card parsing) lives in `agent/corrections.py` so tests import it without loading the whole agent. Pipeline: STT `assemblyai/universal-3-5-pro` · LLM `google/gemma-4-31b-it` · TTS `fishaudio/s2.1-pro` (voice Hannah) — all via LiveKit Inference (`livekit.agents.inference`), so no third-party API keys. Uses the LiveKit turn detector with adaptive interruptions and preemptive generation, plus ai_coustics noise cancellation on input. Deployed to LiveKit Cloud with `lk agent deploy`.
+- `agent/` — the voice agent. Entrypoint `agent/main.py` (Dockerfile CMD); pure correction logic (analyzer prompt, gating, card parsing) lives in `agent/corrections.py` so tests import it without loading the whole agent. Pipeline: STT `assemblyai/universal-3-5-pro` · LLM `google/gemma-4-31b-it` · TTS `fishaudio/s2.1-pro` (voice Hannah) — all via LiveKit Inference (`livekit.agents.inference`), so no third-party API keys. Uses the LiveKit turn detector with adaptive interruptions and preemptive generation, plus ai_coustics noise cancellation on input. Deployed to LiveKit Cloud with `lk agent deploy`.
   - **Live correction notebook**: every completed user turn triggers a background `google/gemini-3.1-flash-lite` analysis (`on_user_turn_completed` → fire-and-forget task, rate-limited, never blocks the reply); real mistakes are pushed as cards on data channel topic `correction` (grammar/word/pronunciation + Chinese point + IPA words, fed by low-confidence STT words). Emma's spoken "更正:" behavior is unchanged.
   - **Simli avatar (opt-in)**: enabled only when `SIMLI_API_KEY` + `SIMLI_FACE_ID` are set in `.env.local`; the avatar worker republishes lip-synced A/V so the agent's own `audio_output` is disabled in that case. Without keys: plain voice, identical to before.
 - `web/` — React 19 + Vite + Tailwind 4 SPA using `livekit-client`, deployed to GitHub Pages (subpath base `/livekit-tutor/`) via `.github/workflows/pages.yml` on pushes touching `web/**`. `web/src/Tutor.tsx` is the app shell (connection, transcript, live correction cards, avatar video, session capture); `web/src/History.tsx` is the history list / sync / replay; `web/src/api.ts` is the backend client (GitHub PAT → backend-issued JWT, silent re-auth on 401).
@@ -23,7 +23,7 @@ Old GitHub-as-storage history (`sessions/` JSON) was dropped intentionally — h
 Agent and server side use `uv`; the web side uses npm. Two separate uv projects: repo root (agent) and `server/`.
 
 ```bash
-lk agent dev agent/agent.py   # run agent locally with hot reload (entrypoint must be explicit after src/→agent/ rename)
+lk agent dev agent/main.py   # run agent locally with hot reload (entrypoint must be explicit after src/→agent/ rename)
 lk agent deploy               # update the LiveKit Cloud deployment (after agent changes)
                               # Simli 密钥经 LiveKit Cloud secrets 注入(不进镜像/git):
                               #   lk agent deploy --secrets SIMLI_API_KEY=xxx --secrets SIMLI_FACE_ID=yyy
@@ -38,7 +38,7 @@ cd web && npm run dev    # web dev server
 cd web && npm run build  # tsc + vite build (what Pages CI runs)
 ```
 
-Secrets live in `.env.local` (gitignored; loaded by `agent/agent.py` via `load_dotenv`): `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`, plus optional `SIMLI_API_KEY` / `SIMLI_FACE_ID`. `livekit.toml` holds the LiveKit Cloud project subdomain and agent id used by `lk agent` commands.
+Secrets live in `.env.local` (gitignored; loaded by `agent/main.py` via `load_dotenv`): `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`, plus optional `SIMLI_API_KEY` / `SIMLI_FACE_ID`. `livekit.toml` holds the LiveKit Cloud project subdomain and agent id used by `lk agent` commands.
 
 Frontend version marker: `APP_VERSION` in `web/src/Tutor.tsx` — bump on every web change; the footer shows it to verify the Pages deploy. The backend URL is `API_BASE` in `web/src/api.ts` (sslip.io domain of the server).
 

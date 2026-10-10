@@ -10,7 +10,7 @@ from unittest import mock
 
 from livekit.agents import llm
 
-from agent.agent import Assistant
+from agent.main import Assistant
 
 GOOD = json.dumps(
     {

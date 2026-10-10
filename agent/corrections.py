@@ -1,7 +1,7 @@
 """实时纠错的纯逻辑:门控、卡片解析、分析 prompt 组装。
 
 不依赖 Agent SDK 会话(只用到 llm.ChatContext 类型),可独立单测;
-hook 接线(何时触发、怎么发布)在 agent/agent.py 的 Assistant 里。
+hook 接线(何时触发、怎么发布)在 agent/main.py 的 Assistant 里。
 """
 
 import json
