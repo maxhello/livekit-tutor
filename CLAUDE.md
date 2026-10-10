@@ -4,37 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # AGENTS.md
 
-This is a LiveKit Agents project (Python SDK for voice AI agents), deployed to LiveKit Cloud. AI 英语口语陪练 "Emma":bilingual short-sentence conversation practice for a Chinese adult beginner (CEFR A1). Personal-use project.
+AI 英语口语陪练 "Emma":bilingual short-sentence conversation practice for a Chinese adult beginner (CEFR A1). Personal-use project.
 
-## Two components, zero backend
+## Three parts, each deployed separately
 
-- `agent/agent.py` — the voice agent (single file; keep `agent.py` as the entrypoint, see Dockerfile). Pipeline: STT `assemblyai/universal-3-5-pro` · LLM `google/gemma-4-31b-it` · TTS `fishaudio/s2.1-pro` (voice Hannah) — all via LiveKit Inference (`livekit.agents.inference`), so no third-party API keys. Uses the LiveKit turn detector with adaptive interruptions and preemptive generation, plus ai_coustics noise cancellation on input.
-- `web/` — React 19 + Vite + Tailwind 4 SPA using `livekit-client`. `web/src/Tutor.tsx` is the app shell (connection, transcript, GitHub accounts, session capture); `web/src/History.tsx` is the local history list / sync-to-GitHub / replay UI; `web/src/github.ts` wraps the Contents API used as zero-backend storage (`sessions/<user>/<timestamp>.json` in this repo). Deployed to GitHub Pages (subpath base `/livekit-tutor/`) via `.github/workflows/pages.yml` on pushes touching `web/**`.
+- `agent/` — the voice agent (single file `agent/agent.py`, the Dockerfile entrypoint). Pipeline: STT `assemblyai/universal-3-5-pro` · LLM `google/gemma-4-31b-it` · TTS `fishaudio/s2.1-pro` (voice Hannah) — all via LiveKit Inference (`livekit.agents.inference`), so no third-party API keys. Uses the LiveKit turn detector with adaptive interruptions and preemptive generation, plus ai_coustics noise cancellation on input. Deployed to LiveKit Cloud with `lk agent deploy`.
+  - **Live correction notebook**: every completed user turn triggers a background `google/gemini-3.1-flash-lite` analysis (`on_user_turn_completed` → fire-and-forget task, rate-limited, never blocks the reply); real mistakes are pushed as cards on data channel topic `correction` (grammar/word/pronunciation + Chinese point + IPA words, fed by low-confidence STT words). Emma's spoken "更正:" behavior is unchanged.
+  - **Simli avatar (opt-in)**: enabled only when `SIMLI_API_KEY` + `SIMLI_FACE_ID` are set in `.env.local`; the avatar worker republishes lip-synced A/V so the agent's own `audio_output` is disabled in that case. Without keys: plain voice, identical to before.
+- `web/` — React 19 + Vite + Tailwind 4 SPA using `livekit-client`, deployed to GitHub Pages (subpath base `/livekit-tutor/`) via `.github/workflows/pages.yml` on pushes touching `web/**`. `web/src/Tutor.tsx` is the app shell (connection, transcript, live correction cards, avatar video, session capture); `web/src/History.tsx` is the history list / sync / replay; `web/src/api.ts` is the backend client (GitHub PAT → backend-issued JWT, silent re-auth on 401).
+- `server/` — history backend (single file `server/main.py`): FastAPI + SQLAlchemy (PostgreSQL in prod, sqlite in tests), GitHub PAT login verified server-side against an allowlist, issues 30-day JWTs; session/message/correction CRUD. Deployed on the user's k3s server: manifests in `server/deploy/` (Traefik ingress + cert-manager Let's Encrypt via `<IP-dashes>.sslip.io`; Postgres StatefulSet on local-path), image built by `.github/workflows/server-image.yml` to `ghcr.io/maxhello/tutor-api`. **Secrets (POSTGRES_PASSWORD, JWT_SECRET) live only in the cluster** (`kubectl create secret`); the repo holds only `secret.example.yaml` + `secretKeyRef`s. Deploy steps: `server/deploy/README.md`.
 
-**Connection flow (no server of our own):** the browser connects directly to the LiveKit Cloud room with a long-lived token created via `lk token create --agent livekit-tutor` — the agent dispatch is embedded in the token, so Emma joins automatically. The token is the only credential; it lives in browser localStorage, never in the repo. Revoking = reissuing tokens under a new room name. If the user picks a practice scenario, the page publishes it on a data channel (`topic: "scenario"`); the agent's `data_received` handler has Emma open in-role. With no scenario, her instructions make her ask what to practice.
+**Connection flow:** the browser connects directly to the LiveKit Cloud room with a long-lived token created via `lk token create --agent livekit-tutor` — the agent dispatch is embedded in the token, so Emma joins automatically. The token is the only credential; it lives in browser localStorage, never in the repo. If the user picks a practice scenario, the page publishes it on a data channel (`topic: "scenario"`); the agent's `data_received` handler has Emma open in-role. The agent pushes correction cards back on `topic: "correction"`. Human participant identity is always `max` (hardcoded in `web/src/Tutor.tsx` and the token); transcript bubbles and speaking state are keyed off it.
 
-Identity convention: the human participant is always identity `max` (hardcoded in both `web/src/Tutor.tsx` and the token); transcript bubbles and speaking state are keyed off it.
+Old GitHub-as-storage history (`sessions/` JSON) was dropped intentionally — history now lives in PostgreSQL only.
 
 ## Commands
 
-Python side uses `uv`; the web side uses npm.
+Agent and server side use `uv`; the web side uses npm. Two separate uv projects: repo root (agent) and `server/`.
 
 ```bash
-lk agent dev            # run agent locally with hot reload
-lk agent deploy         # update the LiveKit Cloud deployment (after agent changes)
+lk agent dev agent/agent.py   # run agent locally with hot reload (entrypoint must be explicit after src/→agent/ rename)
+lk agent deploy               # update the LiveKit Cloud deployment (after agent changes)
 
-# token for the web page (paste into the H5; long-lived)
-lk token create --join --room tutor-max --identity max --valid-for 8760h --agent livekit-tutor
+uv run ruff format && uv run ruff check   # agent lint/format
+uv run pytest                              # agent tests (tests/)
 
-uv run ruff format      # format
-uv run ruff check       # lint
-uv run pytest           # tests (no tests/ directory yet; add one for agent behavior)
+cd server && uv run pytest    # backend tests (sqlite in-memory; server/ has its own uv project)
+cd server && uv run uvicorn main:app --reload   # backend dev (needs a local PG or sqlite fallback)
 
-cd web && npm run dev   # web dev server
-cd web && npm run build # tsc + vite build (what Pages CI runs)
+cd web && npm run dev    # web dev server
+cd web && npm run build  # tsc + vite build (what Pages CI runs)
 ```
 
-Secrets (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET) live in `.env.local` (gitignored; `agent.py` loads it via `load_dotenv`). `livekit.toml` holds the LiveKit Cloud project subdomain and agent id used by `lk agent` commands.
+Secrets live in `.env.local` (gitignored; loaded by `agent/agent.py` via `load_dotenv`): `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`, plus optional `SIMLI_API_KEY` / `SIMLI_FACE_ID`. `livekit.toml` holds the LiveKit Cloud project subdomain and agent id used by `lk agent` commands.
+
+Frontend version marker: `APP_VERSION` in `web/src/Tutor.tsx` — bump on every web change; the footer shows it to verify the Pages deploy. The backend URL is `API_BASE` in `web/src/api.ts` (sslip.io domain of the server).
 
 ## LiveKit Documentation
 
@@ -42,8 +46,8 @@ LiveKit Agents evolves fast — always check the latest docs rather than guessin
 
 ## Agent design
 
-Voice AI is latency-sensitive: keep irrelevant context and tools out of LLM requests. For multi-phase conversations, prefer LiveKit's handoffs/tasks (see https://docs.livekit.io/agents/build/workflows/) over one long instruction prompt.
+Voice AI is latency-sensitive: keep irrelevant context and tools out of LLM requests. Background work (like the correction analyzer) must run as fire-and-forget tasks with held references — never inline in hooks that gate Emma's reply.
 
-When changing core agent behavior (instructions, tool descriptions, tasks/handoffs), don't guess what will work — write tests for the desired behavior first and iterate until they pass. See https://docs.livekit.io/agents/start/testing/.
+When changing core agent behavior (instructions, tool descriptions, tasks/handoffs, the correction pipeline), don't guess what will work — write tests for the desired behavior first and iterate until they pass. See https://docs.livekit.io/agents/start/testing/.
 
 Beyond docs access, the `lk` CLI also manages things like SIP trunks for telephony agents (`lk --help`).
