@@ -274,15 +274,18 @@ async def start_simli_avatar_with_retry(
     api_key: str,
     *,
     attempts: int,
+    stop: asyncio.Event | None = None,
 ) -> "simli.AvatarSession | None":
     """启动 Simli 头像,失败(429 限流/超时未进房)自动重试。
 
     返回成功进房的 AvatarSession;全部失败返回 None。注意插件失败时不抛
-    异常,只提前 return——失败只能从 wait_for_join 超时上观察到。
+    异常,只提前 return——失败只能从 wait_for_join 超时上观察到。stop 置位
+    表示 job 已在关闭,放弃剩余尝试。调用时 room 可能尚未 connect(entrypoint
+    在 ctx.connect() 之前起 avatar),所以不能用连接状态判断去留。
     """
     for attempt in range(1, attempts + 1):
-        if not room.isconnected():
-            logger.info("simli avatar retry skipped: room disconnected")
+        if stop is not None and stop.is_set():
+            logger.info("simli avatar retry skipped: agent shutting down")
             return None
         avatar = _new_simli_avatar(simli_config)
         await avatar.start(session, room=room)
@@ -359,14 +362,26 @@ async def my_agent(ctx: JobContext):
             max_idle_time=120,  # 思考间隙别太快掉线
         )
         # 先内联试一次(成功路径 <10s,不拖会话启动);撞上限流(重连太快/
-        # 旧会话未释放)则转后台等槽位空出再重试,重试成功头像中途接入
+        # 旧会话未释放)则转后台等槽位空出再重试,重试成功头像中途接入。
+        # 注意此时 ctx.connect() 还没执行,room 尚未连接,不能用连接状态判断。
+        stopping = asyncio.Event()
+
+        async def _stop_avatar_retry(_reason: str = "") -> None:
+            stopping.set()
+
+        ctx.add_shutdown_callback(_stop_avatar_retry)
         avatar = await start_simli_avatar_with_retry(
-            session, ctx.room, simli_config, simli_api_key, attempts=1
+            session, ctx.room, simli_config, simli_api_key, attempts=1, stop=stopping
         )
         if avatar is None:
             t = asyncio.create_task(
                 start_simli_avatar_with_retry(
-                    session, ctx.room, simli_config, simli_api_key, attempts=2
+                    session,
+                    ctx.room,
+                    simli_config,
+                    simli_api_key,
+                    attempts=2,
+                    stop=stopping,
                 )
             )
             _avatar_retry_tasks.add(t)

@@ -1,9 +1,10 @@
 """Simli 头像启动重试测试:假 avatar + 假槽位探测,不碰网络与真实插件。
 
 验证:限流失败后等槽位空出再重试能恢复;重试耗尽安全返回 None;
-探测接口挂了照样走完重试;一次成功不多试;房间断开后不再重试。
+探测接口挂了照样走完重试;一次成功不多试;job 关闭后不再重试。
 """
 
+import asyncio
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
@@ -50,7 +51,7 @@ async def _run(outcomes: list[bool], usage_side_effect, attempts: int = 3):
     ):
         return await main_mod.start_simli_avatar_with_retry(
             session=SimpleNamespace(),
-            room=SimpleNamespace(isconnected=lambda: True),
+            room=SimpleNamespace(),
             simli_config=SimpleNamespace(),
             api_key="test-key",
             attempts=attempts,
@@ -88,7 +89,7 @@ async def test_first_try_success_no_retry_no_probe():
     ):
         avatar = await main_mod.start_simli_avatar_with_retry(
             session=SimpleNamespace(),
-            room=SimpleNamespace(isconnected=lambda: True),
+            room=SimpleNamespace(),
             simli_config=SimpleNamespace(),
             api_key="test-key",
             attempts=3,
@@ -98,26 +99,27 @@ async def test_first_try_success_no_retry_no_probe():
     assert probe.call_count == 0  # 成功路径不需要探测
 
 
-async def test_stops_when_room_disconnected():
-    # 用户离开(房间断开)后不再浪费重试,也避免对已关会话替换音频尾
-    state = {"connected": True}
+async def test_stops_when_shutting_down():
+    # job 关闭(用户离开触发 shutdown)后不再浪费重试,也不对已关会话做手脚
+    stop = asyncio.Event()
 
-    async def probe_then_disconnect(*a):
-        state["connected"] = False  # 第 1 次失败的探测一回来,房间已断开
+    async def probe_then_shutdown(*a):
+        stop.set()  # 第 1 次失败的探测一回来,job 已在关闭
         return 0
 
     with (
         mock.patch.object(
             main_mod, "_new_simli_avatar", lambda cfg: FakeAvatar([False, True])
         ),
-        mock.patch.object(main_mod, "_simli_slot_usage", probe_then_disconnect),
+        mock.patch.object(main_mod, "_simli_slot_usage", probe_then_shutdown),
     ):
         avatar = await main_mod.start_simli_avatar_with_retry(
             session=SimpleNamespace(),
-            room=SimpleNamespace(isconnected=lambda: state["connected"]),
+            room=SimpleNamespace(),
             simli_config=SimpleNamespace(),
             api_key="test-key",
             attempts=3,
+            stop=stop,
         )
     assert avatar is None
-    assert len(FakeAvatar.instances) == 1  # 断连后不再做第 2 次尝试
+    assert len(FakeAvatar.instances) == 1  # 关闭后不再做第 2 次尝试
