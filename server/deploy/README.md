@@ -50,7 +50,7 @@ kind: Deployment
 metadata:
   name: tutor-api
   namespace: max
-  labels: &labels
+  labels:
     app: tutor-api
     part-of: livekit-tutor
 spec:
@@ -58,10 +58,14 @@ spec:
   strategy:
     type: Recreate
   selector:
-    matchLabels: *labels
+    matchLabels:
+      app: tutor-api
+      part-of: livekit-tutor
   template:
     metadata:
-      labels: *labels
+      labels:
+        app: tutor-api
+        part-of: livekit-tutor
     spec:
       containers:
         - name: tutor-api
@@ -95,9 +99,13 @@ kind: Service
 metadata:
   name: tutor-api
   namespace: max
-  labels: *labels
+  labels:
+    app: tutor-api
+    part-of: livekit-tutor
 spec:
-  selector: *labels
+  selector:
+    app: tutor-api
+    part-of: livekit-tutor
   ports:
     - port: 8000
 ```
