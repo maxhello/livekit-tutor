@@ -5,7 +5,7 @@ AI 英语口语陪练(Emma):双语短句教学,面向 A1 初学者,自用。
 ```
 web/    陪练 H5 页面(React + livekit-client),GitHub Pages 托管
         https://maxhello.github.io/livekit-tutor/
-src/    Voice agent(LiveKit Agents Python),部署在 LiveKit Cloud
+agent/  Voice agent(LiveKit Agents Python),部署在 LiveKit Cloud
         STT assemblyai/universal-3-5-pro · LLM gemma-4-31b · TTS fishaudio Hannah
         全部走 LiveKit Inference 托管推理,无需第三方 API key
 ```
