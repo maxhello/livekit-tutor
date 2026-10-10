@@ -4,6 +4,7 @@ import {
   RoomEvent,
   Track,
   type Participant,
+  type RemoteTrack,
   type TranscriptionSegment,
 } from 'livekit-client'
 import History, { appendSession } from './History'
@@ -22,7 +23,7 @@ const CURRENT_KEY = 'tutor-current'
 /** 我方 participant identity(后端签 token 时写死),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v5'
+const APP_VERSION = 'v6'
 
 type Status = 'idle' | 'connecting' | 'connected'
 
@@ -128,16 +129,13 @@ export default function Tutor() {
   const scenarioRef = useRef('')
   const endedRef = useRef(true)
   const videoElRef = useRef<HTMLVideoElement | null>(null)
-  /** 头像视频轨 attach 出的隐藏元素:srcObject 镜像给主舞台 <video> */
-  const avatarSrcElRef = useRef<HTMLMediaElement | null>(null)
+  /** 头像视频轨:<video> 挂载后直接 attach(不经隐藏元素,避免双元素黑屏) */
+  const avatarTrackRef = useRef<RemoteTrack | null>(null)
 
-  // 头像 <video> 渲染出来后,把镜像轨的流接过去
+  // <video> 渲染出来后,把 track 直接挂上去
   useEffect(() => {
-    const src = avatarSrcElRef.current
-    const video = videoElRef.current
-    if (avatarVideo && src && video) {
-      video.srcObject = (src as HTMLVideoElement).srcObject
-      video.play().catch(() => {})
+    if (avatarVideo && avatarTrackRef.current && videoElRef.current) {
+      avatarTrackRef.current.attach(videoElRef.current)
     }
   }, [avatarVideo])
 
@@ -243,12 +241,9 @@ export default function Tutor() {
         document.body.appendChild(el)
         els.push(el)
       } else if (track.kind === Track.Kind.Video) {
-        // Emma 的头像视频(Simli 开启时 avatar 代替 agent 发布音视频)
-        const el = track.attach()
-        el.style.display = 'none'
-        document.body.appendChild(el)
-        els.push(el)
-        avatarSrcElRef.current = el
+        // Emma 的头像视频(Simli 开启时 avatar 代替 agent 发布音视频):
+        // 只记 track,等 <video> 挂载后直接 attach
+        avatarTrackRef.current = track
         setAvatarVideo(true)
       }
     })
@@ -279,7 +274,8 @@ export default function Tutor() {
     })
     const cleanup = () => {
       els.forEach((el) => el.remove())
-      avatarSrcElRef.current = null
+      avatarTrackRef.current?.detach()
+      avatarTrackRef.current = null
       setAvatarVideo(false)
     }
     room.on(RoomEvent.Disconnected, () => {
