@@ -10,6 +10,7 @@ dependencies = [
     "sqlalchemy",
     "pyjwt",
     "httpx",
+    "livekit-api",
     "psycopg[binary]",
 ]
 

@@ -170,3 +170,26 @@ def test_list_orders_newest_first():
         c.put(f"/api/sessions/{NOW_MS}", json=sample_payload(), headers=auth(token))
         lst = c.get("/api/sessions", headers=auth(token)).json()
         assert [s["startedAt"] for s in lst] == [NOW_MS, NOW_MS - 5000]
+
+
+def test_livekit_token_requires_auth():
+    with make_client() as c:
+        assert c.post("/api/token").status_code == 401
+
+
+def test_livekit_token_contains_room_and_dispatch():
+    import jwt as pyjwt
+
+    with make_client() as c:
+        token = login(c)
+        r = c.post("/api/token", headers=auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["url"].startswith("wss://")
+        payload = pyjwt.decode(
+            body["token"], options={"verify_signature": False}, algorithms=["HS256"]
+        )
+        # 房间/身份/agent dispatch 都嵌在 token 里,前端拿去直连
+        assert payload["video"]["room"] == "tutor-max"
+        assert payload["sub"] == "max"
+        assert payload["roomConfig"]["agents"][0]["agentName"] == "livekit-tutor"

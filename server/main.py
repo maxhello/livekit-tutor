@@ -3,14 +3,17 @@
 模型在 models.py,鉴权在 auth.py。职责:
 - GitHub PAT 登录校验(服务端调 GitHub API + 白名单)→ 签发 30 天 JWT
 - 练习会话的存/取/删(含消息与纠错卡)
+- LiveKit 房间 token 签发(密钥只在服务端,前端每次开练现领短时 token)
 
 环境变量(生产由 k8s 注入,见 deploy/README.md):
 - DATABASE_URL   models.py 读;例:postgresql+psycopg://tutor:***@postgres:5432/tutor
 - JWT_SECRET     auth.py 读,必填
 - GITHUB_ALLOWLIST auth.py 读;逗号分隔的 GitHub 用户名白名单,空 = 拒绝所有登录
 - CORS_ORIGINS   本文件读;逗号分隔的允许来源(默认 Pages 地址 + 本地 dev)
+- LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET 本文件读;签房间 token 用
 """
 
+import datetime
 import os
 import time
 from contextlib import asynccontextmanager
@@ -18,6 +21,9 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from livekit import api as lk_api
+from livekit.protocol import agent_dispatch as lk_dispatch
+from livekit.protocol.room import RoomConfiguration
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -42,6 +48,16 @@ CORS_ORIGINS = [
     if s.strip()
 ]
 LIST_LIMIT = 200
+
+# LiveKit 房间约定(与前端一致):固定房间、固定 identity,token 内嵌 agent dispatch
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+ROOM_NAME = "tutor-max"
+CALLER_IDENTITY = "max"
+CALLER_NAME = "Max"
+AGENT_NAME = "livekit-tutor"  # 对应 agent/ 里 @server.rtc_session(agent_name=...)
+ROOM_TOKEN_TTL = datetime.timedelta(hours=12)
 
 
 @asynccontextmanager
@@ -106,6 +122,26 @@ def auth_dep(authorization: str = Header(""), db: Session = Depends(get_db)) -> 
 @app.get("/api/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.post("/api/token")
+def livekit_token(user: UserRow = Depends(auth_dep)) -> dict[str, str]:
+    """签一个短时房间 token(内嵌 agent dispatch,Emma 自动进房)。需登录。"""
+    if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(500, "LiveKit credentials not configured")
+    token = (
+        lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(CALLER_IDENTITY)
+        .with_name(CALLER_NAME)
+        .with_grants(lk_api.VideoGrants(room_join=True, room=ROOM_NAME))
+        .with_ttl(ROOM_TOKEN_TTL)
+        .with_room_config(
+            RoomConfiguration(
+                agents=[lk_dispatch.RoomAgentDispatch(agent_name=AGENT_NAME)],
+            )
+        )
+    )
+    return {"token": token.to_jwt(), "url": LIVEKIT_URL}
 
 
 @app.post("/api/auth/login")

@@ -7,5 +7,8 @@ from pathlib import Path
 os.environ.setdefault("JWT_SECRET", "test-secret-0123456789abcdef0123456789abcdef")
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 os.environ.setdefault("GITHUB_ALLOWLIST", "maxhello,alice")
+os.environ.setdefault("LIVEKIT_URL", "wss://test.livekit.cloud")
+os.environ.setdefault("LIVEKIT_API_KEY", "test-key-0123456789abcdef0123456789")
+os.environ.setdefault("LIVEKIT_API_SECRET", "test-secret-0123456789abcdef0123456789")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

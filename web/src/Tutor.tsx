@@ -7,18 +7,15 @@ import {
   type TranscriptionSegment,
 } from 'livekit-client'
 import History, { appendSession } from './History'
-import { login as apiLogin, type Account, type Correction } from './api'
+import { fetchRoomToken, login as apiLogin, type Account, type Correction } from './api'
 
-const TOKEN_KEY = 'tutor-token'
 /** GitHub 账号列表(写历史凭证)与当前登录者,存 localStorage */
 const ACCOUNTS_KEY = 'tutor-accounts'
 const CURRENT_KEY = 'tutor-current'
-/** LiveKit Cloud 项目地址(agent 部署于此) */
-const LIVEKIT_URL = 'wss://max-gkpnqhfq.livekit.cloud'
-/** 我方 participant identity(token 的 sub),转录按身份区分左右气泡 */
+/** 我方 participant identity(后端签 token 时写死),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v3'
+const APP_VERSION = 'v4'
 
 type Status = 'idle' | 'connecting' | 'connected'
 
@@ -86,14 +83,11 @@ function Wave({ active }: { active: boolean }) {
 }
 
 /**
- * AI 英语陪练页:livekit-client 直连 LiveKit Cloud 房间,token 里带 agent dispatch,
- * Emma(云端 voice agent)自动进房,双语短句教学。长期 token 只存 localStorage。
+ * AI 英语陪练页:开始练习时向后端现领短时 LiveKit token(token 里带 agent dispatch,
+ * Emma 自动进房),双人短句教学;纠错卡经 data channel 实时推送。
  * agent 与用户双方的语音转录(SDK 默认开启)在页面上实时滚动显示。
  */
 export default function Tutor() {
-  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) ?? '')
-  const [draft, setDraft] = useState('')
-  const [showTokenInput, setShowTokenInput] = useState(false)
   /** 今日练习场景(可选):连接后经 data channel 推给 Emma 直接入戏;留空则她语音问你 */
   const [scenario, setScenario] = useState('')
   /** GitHub 多账号:本地存多套凭证,可切换;current 为 null 表示未登录 */
@@ -264,8 +258,9 @@ export default function Tutor() {
   }
 
   async function start() {
-    if (!token) {
-      setShowTokenInput(true)
+    if (!current) {
+      setShowLogin(true)
+      setError('先在页脚登录 GitHub,再开始练习(token 由后端自动签发)')
       return
     }
     setStatus('connecting')
@@ -335,7 +330,9 @@ export default function Tutor() {
       }
     })
     try {
-      await room.connect(LIVEKIT_URL, token)
+      // 每次开练都向后端现领一个短时 token(密钥只在服务端,不再手工粘贴)
+      const { token: roomToken, url } = await fetchRoomToken(current)
+      await room.connect(url, roomToken)
       await room.localParticipant.setMicrophoneEnabled(true)
       setMsgs([])
       setCorrections([])
@@ -356,28 +353,13 @@ export default function Tutor() {
     } catch (e) {
       els.forEach((el) => el.remove())
       setStatus('idle')
-      setError(
-        e instanceof Error
-          ? `${e.message} — token 可能已过期,重新生成后替换`
-          : String(e),
-      )
-      setShowTokenInput(true)
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
   function hangUp() {
     endSession()
     roomRef.current?.disconnect()
-  }
-
-  function saveToken() {
-    const v = draft.trim()
-    if (!v) return
-    localStorage.setItem(TOKEN_KEY, v)
-    setToken(v)
-    setDraft('')
-    setShowTokenInput(false)
-    setError('')
   }
 
   return (
@@ -444,7 +426,7 @@ export default function Tutor() {
               <span className="absolute inset-0 -z-10 rounded-full bg-cyan-400/20 blur-2xl transition-all group-hover:bg-cyan-400/30" />
             </button>
             <span className="text-sm text-gray-500">
-              {token ? 'Emma is ready' : '需要先配置 access token ↓'}
+              {current ? 'Emma is ready' : '登录 GitHub 后即可开始练习 ↓'}
             </span>
             <input
               value={scenario}
@@ -522,7 +504,7 @@ export default function Tutor() {
         </ul>
       </details>
 
-      {/* footer:账号 / 房间 token / 版本,低频配置收成一行小字 */}
+      {/* footer:账号 / 版本,低频配置收成一行小字 */}
       <footer className="mt-6 flex flex-wrap items-center justify-center gap-3 text-xs text-gray-600">
         {current ? (
           <>
@@ -539,69 +521,13 @@ export default function Tutor() {
           </>
         ) : (
           <button onClick={() => setShowLogin(true)} className="hover:text-gray-300">
-            GitHub 登录(保存历史)
+            GitHub 登录(练习 + 保存历史)
           </button>
-        )}
-        {token && <span>·</span>}
-        {token && !showTokenInput ? (
-          <>
-            <span className="flex items-center gap-1.5">
-              <span className="size-1.5 rounded-full bg-emerald-500/70" />
-              room token
-            </span>
-            <span>·</span>
-            <button
-              onClick={() => setShowTokenInput(true)}
-              className="text-gray-500 underline underline-offset-2 hover:text-gray-300"
-            >
-              replace
-            </button>
-          </>
-        ) : (
-          token && (
-            <button
-              onClick={() => setShowTokenInput(false)}
-              className="text-gray-500 hover:text-gray-300"
-            >
-              cancel
-            </button>
-          )
         )}
         <span>·</span>
         {/* 部署版本:改前端时把上面的 APP_VERSION +1 */}
         <span>deploy {APP_VERSION}</span>
       </footer>
-
-      {/* token 输入(首次 / 替换 / 出错时展开) */}
-      {showTokenInput && (
-        <div className="card mt-3 space-y-3 p-4">
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            rows={3}
-            spellCheck={false}
-            placeholder="Paste your LiveKit access token (eyJhbGciOi…)"
-            className="w-full resize-none rounded-lg border border-gray-800 bg-gray-900/70 p-3 font-mono text-xs text-gray-200 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
-          />
-          <div className="flex gap-2">
-            <button
-              onClick={saveToken}
-              disabled={!draft.trim()}
-              className="btn-primary px-5 py-2 text-sm"
-            >
-              Save
-            </button>
-            {token && (
-              <button
-                onClick={() => setShowTokenInput(false)}
-                className="btn-ghost px-5 py-2 text-sm"
-              >
-                Cancel
-              </button>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* GitHub 账号卡(登录/多账号切换):写入历史的凭证 */}
       {showLogin && (
@@ -644,7 +570,7 @@ export default function Tutor() {
               value={ghToken}
               onChange={(e) => setGhToken(e.target.value)}
               type="password"
-              placeholder="Access token(仅授权本仓库 Contents 读写)"
+              placeholder="Access token(只需验证身份,不用勾任何权限)"
               className="flex-1 rounded-lg border border-gray-800 bg-gray-900/70 px-3 py-2 text-xs text-gray-200 placeholder:text-gray-600 focus:border-cyan-400/60 focus:outline-none"
             />
           </div>
@@ -668,8 +594,8 @@ export default function Tutor() {
             </button>
           </div>
           <p className="text-[11px] leading-relaxed text-gray-600">
-            登录后才能把练习记录保存到 GitHub(token
-            创建步骤见项目 README)。记录会提交到公开仓库,介意的内容请勿保存。
+            token 只用于验证身份(无需勾选任何权限):GitHub → Settings → Developer
+            settings → Personal access tokens 建 classic token 全不勾即可。练习记录保存在你自己的服务器上。
           </p>
         </div>
       )}

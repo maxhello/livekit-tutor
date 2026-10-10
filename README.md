@@ -14,16 +14,14 @@ server/  历史后端(FastAPI + Neon 免费 PostgreSQL),部署在自己的 k3s �
          部署见 server/deploy/README.md;GitHub 登录沿用,后端校验+白名单
 ```
 
-## 连接原理(通话链路零后端)
+## 连接原理(token 由后端签发)
 
-浏览器拿长期 token 直连 LiveKit Cloud 房间,token 里带 agent dispatch(Emma 自动进房)。
-**token 即门票**:只能进指定房间、可设长有效期,存在浏览器 localStorage,不进仓库。
-泄露就换房间名重新签发,旧 token 全部作废。
+登录后点 Start,页面请求后端 `POST /api/token`,后端用 LiveKit API 密钥现签一个
+**12 小时短时 token**(内嵌 agent dispatch,Emma 自动进房)返回给页面直连。
+LiveKit 密钥只在服务器上,浏览器不再保存任何长期凭证——不用再手工 `lk token create`
+和粘贴换发了。房间固定 `tutor-max`、identity 固定 `max`。
 
-```bash
-# 生成 1 年期 token(粘到页面里)
-lk token create --join --room tutor-max --identity max --valid-for 8760h --agent livekit-tutor
-```
+> 手动调试仍可 `lk token create --join --room tutor-max --identity max --agent livekit-tutor`。
 
 ## 练习历史(GitHub 登录 → 自己的后端)
 

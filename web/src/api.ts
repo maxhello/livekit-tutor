@@ -134,3 +134,8 @@ export async function putSession(
 ): Promise<void> {
   await json(account, 'PUT', `/api/sessions/${startedAt}`, payload)
 }
+
+/** 现领一个短时 LiveKit 房间 token(内嵌 agent dispatch,Emma 自动进房)。需登录。 */
+export function fetchRoomToken(account: Account): Promise<{ token: string; url: string }> {
+  return json(account, 'POST', '/api/token')
+}

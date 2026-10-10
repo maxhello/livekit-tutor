@@ -77,6 +77,13 @@ spec:
               value: "postgresql+psycopg://USER:PASS@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
             - name: JWT_SECRET
               value: "<openssl rand -hex 32 生成>"
+            # LiveKit:签房间 token 用(从 livekit.cloud 控制台拿,同 agent 的 .env.local)
+            - name: LIVEKIT_URL
+              value: "wss://<你的项目>.livekit.cloud"
+            - name: LIVEKIT_API_KEY
+              value: "<API key>"
+            - name: LIVEKIT_API_SECRET
+              value: "<API secret>"
             - name: GITHUB_ALLOWLIST
               value: "maxhello"
             - name: CORS_ORIGINS
