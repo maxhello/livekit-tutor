@@ -4,7 +4,7 @@
 #   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
 #
 # 域名规则:sslip.io 把「任意前缀 + IP 横杠」都解析到该 IP,所以每个服务
-# 分一个子域名(tutor / blog / xxx.161-118-202-85.sslip.io),各自独立 Ingress
+# 分一个子域名(tutor / blog / xxx.161-118-222-205.sslip.io),各自独立 Ingress
 # + 各自证书,加新服务互不干扰。以后买了真域名:改下面两处 host 即可。
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -32,10 +32,10 @@ metadata:
 spec:
   ingressClassName: traefik # k3s 自带
   tls:
-    - hosts: ["tutor.161-118-202-85.sslip.io"] # 每个服务一个子域名(sslip.io 任意前缀都解析到 161.118.202.85)
+    - hosts: ["tutor.161-118-222-205.sslip.io"] # 每个服务一个子域名(sslip.io 任意前缀都解析到 161.118.222.205)
       secretName: tutor-api-tls
   rules:
-    - host: tutor.161-118-202-85.sslip.io
+    - host: tutor.161-118-222-205.sslip.io
       http:
         paths:
           - path: /

@@ -2,12 +2,12 @@
 
 三部分:API(GHCR 镜像)· 入口(自带 Traefik + cert-manager 自动 HTTPS)· 数据库(Neon 免费 serverless PostgreSQL,不在集群里)。
 
-域名已定:本服务用 `tutor.161-118-202-85.sslip.io`(ingress.yaml 和 web/src/api.ts 都已填好)。
+域名已定:本服务用 `tutor.161-118-222-205.sslip.io`(ingress.yaml 和 web/src/api.ts 都已填好)。
 sslip.io 会把「任意前缀 + IP 横杠」解析到该 IP,所以**每个服务一个子域名**(以后第二个服务用
-`xxx.161-118-202-85.sslip.io`,新建一个 Ingress 即可,互不干扰)。
+`xxx.161-118-222-205.sslip.io`,新建一个 Ingress 即可,互不干扰)。
 邮箱已填,**清单里没有要改的了**。
 
-> 国内服务器注意:未备案域名走 80/443 可能被拦。先 `curl http://161.118.202.85` 验证;不行就把 Ingress 挂到非标端口(8080/8443)或改用 Cloudflare Tunnel。
+> 国内服务器注意:未备案域名走 80/443 可能被拦。先 `curl http://161.118.222.205` 验证;不行就把 Ingress 挂到非标端口(8080/8443)或改用 Cloudflare Tunnel。
 
 ## 数据库:Neon(一次性)
 
@@ -26,7 +26,7 @@ sslip.io 会把「任意前缀 + IP 横杠」解析到该 IP,所以**每个服�
    - Application name:随意(如 tutor)
    - Homepage URL:`https://maxhello.github.io/livekit-tutor`
    - Authorization callback URL(必须一字不差):
-     `https://tutor.161-118-202-85.sslip.io/api/auth/github/callback`
+     `https://tutor.161-118-222-205.sslip.io/api/auth/github/callback`
 2. 建好后把 **Client ID** 和 **Client secret**(Generate a new client secret)填进
    `tutor-api.yaml` 的 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`,然后
    `kubectl apply -f server/deploy/tutor-api.yaml`
@@ -103,7 +103,7 @@ spec:
             - name: GITHUB_CLIENT_SECRET
               value: "<OAuth App Client secret>"
             - name: API_PUBLIC_URL
-              value: "https://tutor.161-118-202-85.sslip.io"
+              value: "https://tutor.161-118-222-205.sslip.io"
             - name: FRONTEND_URL
               value: "https://maxhello.github.io/livekit-tutor"
             - name: GITHUB_ALLOWLIST
