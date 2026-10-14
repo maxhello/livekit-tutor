@@ -11,7 +11,7 @@ agent/   Voice agent(LiveKit Agents Python),部署在 LiveKit Cloud
          实时纠错:每轮说完后台小模型分析,纠错卡推到页面错题本
          Simli 真人头像(可选):配置 SIMLI_API_KEY/SIMLI_FACE_ID 即启用
 server/  历史后端(FastAPI + Neon 免费 PostgreSQL),部署在自己的 k3s 服务器
-         部署见 server/deploy/README.md;GitHub 登录沿用,后端校验+白名单
+         GitHub 登录沿用,后端校验+白名单
 ```
 
 ## 连接原理(token 由后端签发)
@@ -30,10 +30,8 @@ LiveKit 密钥只在服务器上,浏览器不再保存任何长期凭证——�
 不登录不能练(token 也由后端签发)。
 
 - 登录是 **GitHub OAuth 一键授权**(跳转 GitHub 点一下 Authorize,无需输入账号/token);
-  白名单(`GITHUB_ALLOWLIST`)外的账号会被拒。首次需建一个 OAuth App,见
-  `server/deploy/README.md` 的「GitHub OAuth App」一节
-- 后端地址在 `web/src/api.ts` 的 `API_BASE`(sslip.io 域名,见 `server/deploy/README.md`)
-- 服务器部署/更新/备份:`server/deploy/README.md`
+  白名单(`GITHUB_ALLOWLIST`)外的账号会被拒。首次需建一个 OAuth App
+- 后端地址在 `web/src/api.ts` 的 `API_BASE`(sslip.io 域名)
 
 ## 常用命令
 

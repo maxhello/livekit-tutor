@@ -33,6 +33,3 @@ KMS
 .github/personal-instructions.md
 node_modules/
 dist/
-
-# 真实密钥(明文,只在本机/服务器)
-server/deploy/tutor-api.yaml

@@ -1,12 +1,12 @@
 /**
- * 后端 API 客户端(后端见 server/main.py,部署见 server/deploy/README.md)。
+ * 后端 API 客户端(后端见 server/main.py)。
  *
  * 登录沿用 GitHub PAT:页面把 PAT 发给后端,后端调 GitHub API 校验并按白名单
  * 放行,签发 30 天 JWT;之后所有请求带 JWT,过期(401)用本地 PAT 静默重签。
  */
 
 /** 后端地址:k3s Traefik 入口的 HTTPS 域名。sslip.io 规则:IP 1.2.3.4 → 1-2-3-4.sslip.io */
-export const API_BASE = 'https://tutor.161-118-222-205.sslip.io' // 本服务的 sslip.io 子域名(每服务一个,见 server/deploy/ingress.yaml)
+export const API_BASE = 'https://tutor.161-118-222-205.sslip.io' // 本服务的 sslip.io 子域名(每服务一个)
 
 /** GitHub 账号:token 是 PAT(用于向后端换取/续期 JWT) */
 export type Account = { user: string; token: string }
