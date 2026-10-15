@@ -7,14 +7,16 @@ import {
   type RemoteTrack,
   type TranscriptionSegment,
 } from 'livekit-client'
-import History, { appendSession } from './History'
+import History from './History'
 import {
   consumeOAuthHash,
   fetchRoomToken,
   GITHUB_AUTH_URL,
+  putSession,
   saveApiToken,
   type Account,
   type Correction,
+  type SessionPayload,
 } from './api'
 
 /** GitHub 账号列表(写历史凭证)与当前登录者,存 localStorage */
@@ -23,7 +25,9 @@ const CURRENT_KEY = 'tutor-current'
 /** 我方 participant identity(后端签 token 时写死),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v9'
+const APP_VERSION = 'v10'
+/** 挂断自动保存的最多尝试次数 */
+const SAVE_ATTEMPTS = 3
 
 type Status = 'idle' | 'connecting' | 'connected'
 
@@ -108,7 +112,7 @@ export default function Tutor() {
     }
   })
   const [showLogin, setShowLogin] = useState(false)
-  /** 通知 History 重读本地:新会话落盘时 +1 */
+  /** 通知 History 重新拉取:会话保存成功时 +1 */
   const [historyTick, setHistoryTick] = useState(0)
   const [status, setStatus] = useState<Status>('idle')
   const [error, setError] = useState('')
@@ -125,7 +129,9 @@ export default function Tutor() {
   /** 通话中状态快照:事件回调闭包读不到最新 state,走 ref */
   const msgsRef = useRef<Msg[]>([])
   const correctionsRef = useRef<Correction[]>([])
-  const startedAtRef = useRef(0)
+  /** 本次会话 id:后端签房间 token 时建好(开始时间也取服务器时间) */
+  const sessionIdRef = useRef<number | null>(null)
+  const accountRef = useRef<Account | null>(null)
   const scenarioRef = useRef('')
   const endedRef = useRef(true)
   const videoElRef = useRef<HTMLVideoElement | null>(null)
@@ -197,25 +203,36 @@ export default function Tutor() {
     })
   }
 
-  /** 通话结束:字幕快照落 localStorage(为空不存),通知历史区刷新;endedRef 防挂断事件重复触发 */
+  /** 通话结束:自动保存到后端(为空不存),成功后通知历史区刷新;endedRef 防挂断事件重复触发 */
   function endSession() {
     if (endedRef.current) return
     endedRef.current = true
-    const startedAt = startedAtRef.current
+    const id = sessionIdRef.current
+    const account = accountRef.current
     const snapshot = msgsRef.current
-    if (!snapshot.length) return
-    const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000))
-    appendSession({
-      id: startedAt,
-      startedAt,
-      seconds,
+    if (id == null || !account || !snapshot.length) return
+    void saveSession(account, id, {
       scenario: scenarioRef.current,
-      msgs: snapshot,
+      msgs: snapshot.map(({ role, text }) => ({ role, text })),
       corrections: correctionsRef.current,
-      synced: false,
-      owner: '',
     })
-    setHistoryTick((t) => t + 1)
+  }
+
+  /** 保存可重复调用(后端整体覆盖),失败间隔重试,最终失败才提示 */
+  async function saveSession(account: Account, id: number, payload: SessionPayload) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await putSession(account, id, payload)
+        setHistoryTick((t) => t + 1)
+        return
+      } catch (e) {
+        if (attempt >= SAVE_ATTEMPTS) {
+          setError(`本次练习保存失败:${e instanceof Error ? e.message : String(e)}`)
+          return
+        }
+        await new Promise((r) => setTimeout(r, attempt * 1500))
+      }
+    }
   }
 
   function logout() {
@@ -295,7 +312,7 @@ export default function Tutor() {
     })
     try {
       // 每次开练都向后端现领一个短时 token(密钥只在服务端,不再手工粘贴)
-      const { token: roomToken, url } = await fetchRoomToken(current)
+      const { token: roomToken, url, sessionId } = await fetchRoomToken(current)
       await room.connect(url, roomToken)
       await room.localParticipant.setMicrophoneEnabled(true)
       setMsgs([])
@@ -303,7 +320,8 @@ export default function Tutor() {
       msgIndex.current.clear()
       msgsRef.current = []
       correctionsRef.current = []
-      startedAtRef.current = Date.now()
+      sessionIdRef.current = sessionId
+      accountRef.current = current
       scenarioRef.current = scenario.trim()
       endedRef.current = false
       setStatus('connected')

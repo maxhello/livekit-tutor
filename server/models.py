@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, ForeignKey, UniqueConstraint, create_engine
+from sqlalchemy import JSON, DateTime, ForeignKey, create_engine
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -25,19 +25,29 @@ class UserRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     github_login: Mapped[str] = mapped_column(unique=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class SessionRow(Base):
     __tablename__ = "sessions"
-    __table_args__ = (UniqueConstraint("user_id", "started_at"),)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True)  # 前端用作会话 id
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    started_at: Mapped[int]  # 会话开始时间,毫秒时间戳(前端用作 id)
-    seconds: Mapped[int] = mapped_column(default=0)
+    # 起止时间都由服务器生成:领房间 token 时建会话,第一次保存时记结束
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scenario: Mapped[str] = mapped_column(default="")
-    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(
+        default=lambda: datetime.now(timezone.utc)
+    )
 
     messages: Mapped[list["MessageRow"]] = relationship(
         back_populates="session",

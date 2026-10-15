@@ -3,7 +3,8 @@
 模型在 models.py,鉴权在 auth.py。职责:
 - GitHub PAT 登录校验(服务端调 GitHub API + 白名单)→ 签发 30 天 JWT
 - 练习会话的存/取/删(含消息与纠错卡)
-- LiveKit 房间 token 签发(密钥只在服务端,前端每次开练现领短时 token)
+- LiveKit 房间 token 签发(密钥只在服务端,前端每次开练现领短时 token),
+  同时建会话:会话 id、起止时间全部由服务器生成
 
 环境变量(生产由 k8s 注入,见 deploy/README.md):
 - DATABASE_URL   models.py 读;例:postgresql+psycopg://tutor:***@postgres:5432/tutor
@@ -16,7 +17,6 @@
 import datetime
 import os
 import secrets
-import time
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlencode
@@ -29,7 +29,7 @@ from livekit import api as lk_api
 from livekit.protocol import agent_dispatch as lk_dispatch
 from livekit.protocol.room import RoomConfiguration
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from auth import GITHUB_ALLOWLIST, JWT_SECRET, _github_login, current_user, make_token
@@ -41,6 +41,7 @@ from models import (
     UserRow,
     engine,
     get_db,
+    utcnow,
 )
 
 CORS_ORIGINS = [
@@ -66,7 +67,9 @@ ROOM_TOKEN_TTL = datetime.timedelta(hours=12)
 # GitHub OAuth 一键登录(创建 OAuth App 见 deploy/README.md)
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
-API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "").rstrip("/")  # 本服务对外地址(拼 callback)
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "").rstrip(
+    "/"
+)  # 本服务对外地址(拼 callback)
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")  # 授权完跳回的前端地址
 
 
@@ -107,7 +110,6 @@ class CorrectionIn(BaseModel):
 
 
 class SessionIn(BaseModel):
-    seconds: int
     scenario: str = ""
     msgs: list[MsgIn]
     corrections: list[CorrectionIn] = []
@@ -135,8 +137,11 @@ def health() -> dict[str, bool]:
 
 
 @app.post("/api/token")
-def livekit_token(user: UserRow = Depends(auth_dep)) -> dict[str, str]:
-    """签一个短时房间 token(内嵌 agent dispatch,Emma 自动进房)。需登录。"""
+def livekit_token(
+    user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """签一个短时房间 token(内嵌 agent dispatch,Emma 自动进房),同时建一条会话
+    (开始时间取服务器时间),返回 sessionId 供挂断时保存。需登录。"""
     if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise HTTPException(500, "LiveKit credentials not configured")
     token = (
@@ -151,7 +156,10 @@ def livekit_token(user: UserRow = Depends(auth_dep)) -> dict[str, str]:
             )
         )
     )
-    return {"token": token.to_jwt(), "url": LIVEKIT_URL}
+    session = SessionRow(user_id=user.id)
+    db.add(session)
+    db.commit()
+    return {"token": token.to_jwt(), "url": LIVEKIT_URL, "sessionId": session.id}
 
 
 @app.post("/api/auth/login")
@@ -181,7 +189,9 @@ def _oauth_redirect_uri() -> str:
 
 @app.get("/api/auth/github")
 def github_auth() -> RedirectResponse:
-    if not (GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET and API_PUBLIC_URL and FRONTEND_URL):
+    if not (
+        GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET and API_PUBLIC_URL and FRONTEND_URL
+    ):
         raise HTTPException(500, "GitHub OAuth not configured")
     state = secrets.token_urlsafe(16)
     url = "https://github.com/login/oauth/authorize?" + urlencode(
@@ -247,10 +257,22 @@ def github_callback(
     return resp
 
 
+def _ms(dt: datetime.datetime) -> int:
+    """时间 → 毫秒时间戳(sqlite 读回来不带时区,按 UTC 处理)。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _seconds(s: SessionRow) -> int:
+    return round((_ms(s.ended_at) - _ms(s.started_at)) / 1000) if s.ended_at else 0
+
+
 def _session_out(s: SessionRow) -> dict[str, Any]:
     return {
-        "startedAt": s.started_at,
-        "seconds": s.seconds,
+        "id": s.id,
+        "startedAt": _ms(s.started_at),
+        "seconds": _seconds(s),
         "scenario": s.scenario,
         "msgs": len(s.messages),
         "corrections": len(s.corrections),
@@ -259,8 +281,9 @@ def _session_out(s: SessionRow) -> dict[str, Any]:
 
 def _session_detail(s: SessionRow) -> dict[str, Any]:
     return {
-        "startedAt": s.started_at,
-        "seconds": s.seconds,
+        "id": s.id,
+        "startedAt": _ms(s.started_at),
+        "seconds": _seconds(s),
         "scenario": s.scenario,
         "msgs": [{"role": m.role, "text": m.text} for m in s.messages],
         "corrections": [
@@ -277,13 +300,9 @@ def _session_detail(s: SessionRow) -> dict[str, Any]:
     }
 
 
-def _find_session(db: Session, user: UserRow, started_at: int) -> SessionRow:
-    s = db.scalar(
-        select(SessionRow).where(
-            SessionRow.user_id == user.id, SessionRow.started_at == started_at
-        )
-    )
-    if s is None:
+def _find_session(db: Session, user: UserRow, session_id: int) -> SessionRow:
+    s = db.get(SessionRow, session_id)
+    if s is None or s.user_id != user.id:
         raise HTTPException(404, "session not found")
     return s
 
@@ -292,41 +311,35 @@ def _find_session(db: Session, user: UserRow, started_at: int) -> SessionRow:
 def list_sessions(
     user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
+    # 连上就断、一句话没说的会话不列出
+    has_msgs = exists().where(MessageRow.session_id == SessionRow.id)
     rows = db.scalars(
         select(SessionRow)
-        .where(SessionRow.user_id == user.id)
-        .order_by(SessionRow.started_at.desc())
+        .where(SessionRow.user_id == user.id, has_msgs)
+        .order_by(SessionRow.started_at.desc(), SessionRow.id.desc())
         .limit(LIST_LIMIT)
     ).all()
     return [_session_out(s) for s in rows]
 
 
-@app.get("/api/sessions/{started_at}")
+@app.get("/api/sessions/{session_id}")
 def get_session(
-    started_at: int, user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
+    session_id: int, user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
 ) -> dict[str, Any]:
-    return _session_detail(_find_session(db, user, started_at))
+    return _session_detail(_find_session(db, user, session_id))
 
 
-@app.put("/api/sessions/{started_at}")
+@app.put("/api/sessions/{session_id}")
 def put_session(
-    started_at: int,
+    session_id: int,
     body: SessionIn,
     user: UserRow = Depends(auth_dep),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    # 只接受合理的 epoch-ms(下界 2020-09,上界允许 10 分钟时钟偏差),防脏数据
-    if not (1_600_000_000_000 < started_at <= int(time.time() * 1000) + 600_000):
-        raise HTTPException(422, "started_at must be an epoch-ms timestamp")
-    s = db.scalar(
-        select(SessionRow).where(
-            SessionRow.user_id == user.id, SessionRow.started_at == started_at
-        )
-    )
-    if s is None:
-        s = SessionRow(user_id=user.id, started_at=started_at)
-        db.add(s)
-    s.seconds = body.seconds
+    """保存会话内容(整体覆盖,可重复调用);第一次保存时记下结束时间。"""
+    s = _find_session(db, user, session_id)
+    if s.ended_at is None:
+        s.ended_at = utcnow()
     s.scenario = body.scenario
     s.messages = [
         MessageRow(idx=i, role=m.role, text=m.text) for i, m in enumerate(body.msgs)
@@ -347,10 +360,10 @@ def put_session(
     return {"ok": True}
 
 
-@app.delete("/api/sessions/{started_at}")
+@app.delete("/api/sessions/{session_id}")
 def delete_session(
-    started_at: int, user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
+    session_id: int, user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
 ) -> dict[str, bool]:
-    db.delete(_find_session(db, user, started_at))
+    db.delete(_find_session(db, user, session_id))
     db.commit()
     return {"ok": True}

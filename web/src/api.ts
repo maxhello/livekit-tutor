@@ -21,15 +21,16 @@ export type Correction = {
   at: number // 距会话开始毫秒
 }
 
+/** 挂断时上传的会话内容;会话 id、起止时间都由后端生成 */
 export type SessionPayload = {
-  seconds: number
   scenario: string
   msgs: { role: 'emma' | 'me'; text: string }[]
   corrections: Correction[]
 }
 
-/** 列表条目(只有计数,不含正文) */
+/** 列表条目(只有计数,不含正文);startedAt/seconds 由后端时间算出 */
 export type SessionSummary = {
+  id: number
   startedAt: number
   seconds: number
   scenario: string
@@ -38,7 +39,7 @@ export type SessionSummary = {
 }
 
 /** 详情(含正文与纠错卡) */
-export type SessionDetail = SessionPayload & { startedAt: number }
+export type SessionDetail = SessionPayload & { id: number; startedAt: number; seconds: number }
 
 /** 每个账号的 JWT 分开存 */
 const tokenKey = (user: string) => `tutor-api-token:${user}`
@@ -143,23 +144,25 @@ export function listSessions(account: Account): Promise<SessionSummary[]> {
 }
 
 /** 单条详情(消息 + 纠错卡) */
-export function getSession(
-  account: Account,
-  startedAt: number,
-): Promise<SessionDetail> {
-  return json(account, 'GET', `/api/sessions/${startedAt}`)
+export function getSession(account: Account, id: number): Promise<SessionDetail> {
+  return json(account, 'GET', `/api/sessions/${id}`)
 }
 
-/** 整体 upsert 一条会话(挂断时提交) */
+/** 整体覆盖保存一条会话(挂断时自动提交,可重复调用) */
 export async function putSession(
   account: Account,
-  startedAt: number,
+  id: number,
   payload: SessionPayload,
 ): Promise<void> {
-  await json(account, 'PUT', `/api/sessions/${startedAt}`, payload)
+  await json(account, 'PUT', `/api/sessions/${id}`, payload)
 }
 
-/** 现领一个短时 LiveKit 房间 token(内嵌 agent dispatch,Emma 自动进房)。需登录。 */
-export function fetchRoomToken(account: Account): Promise<{ token: string; url: string }> {
+/**
+ * 现领一个短时 LiveKit 房间 token(内嵌 agent dispatch,Emma 自动进房)。需登录。
+ * 后端同时建好本次会话(开始时间取服务器时间),返回 sessionId 供挂断时保存。
+ */
+export function fetchRoomToken(
+  account: Account,
+): Promise<{ token: string; url: string; sessionId: number }> {
   return json(account, 'POST', '/api/token')
 }

@@ -4,13 +4,13 @@
 """
 
 import contextlib
+import datetime
 import time
 
 from fastapi.testclient import TestClient
 
 import main
-
-NOW_MS = int(time.time() * 1000)
+from models import SessionLocal
 
 
 @contextlib.contextmanager
@@ -19,7 +19,9 @@ def make_client(github_login: str = "maxhello", pat_ok: bool = True):
     main._github_login = (lambda pat: github_login) if pat_ok else (lambda pat: None)
     main.Base.metadata.drop_all(main.engine)
     main.Base.metadata.create_all(main.engine)
-    with TestClient(main.app, base_url="https://testserver") as client:  # https 让 secure cookie 可回传
+    with TestClient(
+        main.app, base_url="https://testserver"
+    ) as client:  # https 让 secure cookie 可回传
         yield client
 
 
@@ -33,9 +35,15 @@ def auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def start_session(client: TestClient, token: str) -> int:
+    """开练:领房间 token,后端顺带建会话并返回 sessionId。"""
+    r = client.post("/api/token", headers=auth(token))
+    assert r.status_code == 200, r.text
+    return r.json()["sessionId"]
+
+
 def sample_payload() -> dict:
     return {
-        "seconds": 120,
         "scenario": "ordering coffee",
         "msgs": [
             {"role": "emma", "text": "Hi! What would you like?"},
@@ -81,8 +89,8 @@ def test_login_rejects_pat_of_other_user():
 def test_endpoints_require_token():
     with make_client() as c:
         assert c.get("/api/sessions").status_code == 401
-        assert c.get("/api/sessions/123").status_code == 401
-        assert c.put("/api/sessions/123", json=sample_payload()).status_code == 401
+        assert c.get("/api/sessions/1").status_code == 401
+        assert c.put("/api/sessions/1", json=sample_payload()).status_code == 401
 
 
 def test_rejects_bad_token():
@@ -91,62 +99,113 @@ def test_rejects_bad_token():
         assert r.status_code == 401
 
 
+def test_token_creates_session_with_server_start_time():
+    with make_client() as c:
+        token = login(c)
+        before = int(time.time() * 1000)
+        sid = start_session(c, token)
+        after = int(time.time() * 1000)
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        detail = c.get(f"/api/sessions/{sid}", headers=auth(token)).json()
+        assert detail["id"] == sid
+        assert before - 1000 <= detail["startedAt"] <= after + 1000
+
+
+def test_each_start_gets_a_new_id():
+    with make_client() as c:
+        token = login(c)
+        assert start_session(c, token) != start_session(c, token)
+
+
 def test_put_list_get_roundtrip():
     with make_client() as c:
         token = login(c)
-        sid = NOW_MS
+        sid = start_session(c, token)
         put = c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
         assert put.status_code == 200, put.text
 
         lst = c.get("/api/sessions", headers=auth(token)).json()
-        assert lst == [
-            {
-                "startedAt": sid,
-                "seconds": 120,
-                "scenario": "ordering coffee",
-                "msgs": 2,
-                "corrections": 1,
-            }
-        ]
+        assert len(lst) == 1
+        assert lst[0]["id"] == sid
+        assert lst[0]["scenario"] == "ordering coffee"
+        assert lst[0]["msgs"] == 2 and lst[0]["corrections"] == 1
+        assert lst[0]["seconds"] >= 0
 
         detail = c.get(f"/api/sessions/{sid}", headers=auth(token)).json()
         assert detail["msgs"][1]["text"] == "I want a coffee"
         assert detail["corrections"][0]["words"][0]["ipa"] == "/ˈkɒfi/"
 
 
-def test_put_is_upsert_replacing_children():
+def test_duration_is_server_side():
     with make_client() as c:
         token = login(c)
-        sid = NOW_MS
+        sid = start_session(c, token)
+        # 把开始时间往前拨 90 秒,模拟一次 90 秒的通话
+        with SessionLocal() as db:
+            row = db.get(main.SessionRow, sid)
+            row.started_at = row.started_at - datetime.timedelta(seconds=90)
+            db.commit()
         c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        assert (
+            89 <= c.get("/api/sessions", headers=auth(token)).json()[0]["seconds"] <= 91
+        )
+
+
+def test_put_is_idempotent_and_keeps_first_end_time():
+    with make_client() as c:
+        token = login(c)
+        sid = start_session(c, token)
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        with SessionLocal() as db:
+            ended = db.get(main.SessionRow, sid).ended_at
         p2 = sample_payload()
         p2["msgs"] = [{"role": "me", "text": "hi"}]
         p2["corrections"] = []
         c.put(f"/api/sessions/{sid}", json=p2, headers=auth(token))
         lst = c.get("/api/sessions", headers=auth(token)).json()
+        assert len(lst) == 1  # 重复保存不会多出一条
         assert lst[0]["msgs"] == 1 and lst[0]["corrections"] == 0
         detail = c.get(f"/api/sessions/{sid}", headers=auth(token)).json()
         assert detail["msgs"] == [{"role": "me", "text": "hi"}]
+        with SessionLocal() as db:
+            assert db.get(main.SessionRow, sid).ended_at == ended
 
 
-def test_rejects_non_timestamp_id():
+def test_put_unknown_id_is_404():
     with make_client() as c:
         token = login(c)
-        r = c.put("/api/sessions/1", json=sample_payload(), headers=auth(token))
-        assert r.status_code == 422
+        r = c.put("/api/sessions/999", json=sample_payload(), headers=auth(token))
+        assert r.status_code == 404
+
+
+def test_list_hides_empty_sessions():
+    with make_client() as c:
+        token = login(c)
+        start_session(c, token)  # 连上就断,没保存
+        sid = start_session(c, token)
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        assert [
+            s["id"] for s in c.get("/api/sessions", headers=auth(token)).json()
+        ] == [sid]
 
 
 def test_user_isolation():
     with make_client() as c:
         token_a = login(c)
-        sid = NOW_MS
+        sid = start_session(c, token_a)
         c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token_a))
 
-        # alice 是白名单里另一个用户,看不到 maxhello 的会话
+        # alice 是白名单里另一个用户,看不到也改不了 maxhello 的会话
         main._github_login = lambda pat: "alice"
         token_b = login(c, user="alice")
         assert c.get("/api/sessions", headers=auth(token_b)).json() == []
         assert c.get(f"/api/sessions/{sid}", headers=auth(token_b)).status_code == 404
+        assert (
+            c.put(
+                f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token_b)
+            ).status_code
+            == 404
+        )
         assert (
             c.delete(f"/api/sessions/{sid}", headers=auth(token_b)).status_code == 404
         )
@@ -155,7 +214,7 @@ def test_user_isolation():
 def test_delete():
     with make_client() as c:
         token = login(c)
-        sid = NOW_MS
+        sid = start_session(c, token)
         c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
         assert c.delete(f"/api/sessions/{sid}", headers=auth(token)).status_code == 200
         assert c.get(f"/api/sessions/{sid}", headers=auth(token)).status_code == 404
@@ -164,12 +223,12 @@ def test_delete():
 def test_list_orders_newest_first():
     with make_client() as c:
         token = login(c)
-        c.put(
-            f"/api/sessions/{NOW_MS - 5000}", json=sample_payload(), headers=auth(token)
-        )
-        c.put(f"/api/sessions/{NOW_MS}", json=sample_payload(), headers=auth(token))
+        first = start_session(c, token)
+        second = start_session(c, token)
+        for sid in (first, second):
+            c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
         lst = c.get("/api/sessions", headers=auth(token)).json()
-        assert [s["startedAt"] for s in lst] == [NOW_MS, NOW_MS - 5000]
+        assert [s["id"] for s in lst] == [second, first]
 
 
 def test_livekit_token_requires_auth():
@@ -186,6 +245,7 @@ def test_livekit_token_contains_room_and_dispatch():
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["url"].startswith("wss://")
+        assert isinstance(body["sessionId"], int)
         payload = pyjwt.decode(
             body["token"], options={"verify_signature": False}, algorithms=["HS256"]
         )
@@ -236,7 +296,9 @@ def test_oauth_callback_success_flow():
         assert loc.startswith("https://front.test/#gh=")
         jwt_token = loc.split("#gh=")[1].split("&")[0]
         payload = pyjwt.decode(
-            jwt_token, "test-secret-0123456789abcdef0123456789abcdef", algorithms=["HS256"]
+            jwt_token,
+            "test-secret-0123456789abcdef0123456789abcdef",
+            algorithms=["HS256"],
         )
         assert payload["login"] == "maxhello"
 
