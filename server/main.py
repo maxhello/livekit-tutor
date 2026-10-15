@@ -5,6 +5,7 @@
 - 练习会话的存/取/删(含消息与纠错卡)
 - LiveKit 房间 token 签发(密钥只在服务端,前端每次开练现领短时 token),
   同时建会话:会话 id、起止时间全部由服务器生成
+- LiveKit webhook:用户离开房间时补记结束时间(浏览器直接关掉、没走挂断保存也有)
 
 环境变量(生产由 k8s 注入,见 deploy/README.md):
 - DATABASE_URL   models.py 读;例:postgresql+psycopg://tutor:***@postgres:5432/tutor
@@ -23,7 +24,7 @@ from typing import Annotated, Any
 from urllib.parse import urlencode, urlsplit
 
 import httpx
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from livekit import api as lk_api
@@ -64,6 +65,9 @@ CALLER_IDENTITY = "max"
 CALLER_NAME = "Max"
 AGENT_NAME = "livekit-tutor"  # 对应 agent/ 里 @server.rtc_session(agent_name=...)
 ROOM_TOKEN_TTL = datetime.timedelta(hours=12)
+# 会话 id 写进参与者 attributes(用户没有改自己 attributes 的权限),
+# webhook 的 participant_left 原样带回,据此找到是哪次会话
+SESSION_ATTR = "session_id"
 
 # GitHub OAuth 一键登录(创建 OAuth App 见 deploy/README.md)
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
@@ -189,10 +193,19 @@ def livekit_token(
     if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise HTTPException(500, "LiveKit credentials not configured")
     practice = practice_of(body)
+    session = SessionRow(user_id=user.id)
+    if practice and practice["mode"] == "scenario":
+        session.scenario = practice["scenario"]
+    elif practice and practice["mode"] == "unit":
+        session.unit_index = practice["unit"]["index"]
+        session.unit_label = practice["unit"]["label"]
+    db.add(session)
+    db.commit()
     token = (
         lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(CALLER_IDENTITY)
         .with_name(CALLER_NAME)
+        .with_attributes({SESSION_ATTR: str(session.id)})
         .with_grants(lk_api.VideoGrants(room_join=True, room=ROOM_NAME))
         .with_ttl(ROOM_TOKEN_TTL)
         .with_room_config(
@@ -208,15 +221,34 @@ def livekit_token(
             )
         )
     )
-    session = SessionRow(user_id=user.id)
-    if practice and practice["mode"] == "scenario":
-        session.scenario = practice["scenario"]
-    elif practice and practice["mode"] == "unit":
-        session.unit_index = practice["unit"]["index"]
-        session.unit_label = practice["unit"]["label"]
-    db.add(session)
-    db.commit()
     return {"token": token.to_jwt(), "url": LIVEKIT_URL, "sessionId": session.id}
+
+
+@app.post("/api/livekit/webhook")
+async def livekit_webhook(
+    request: Request, authorization: str = Header(""), db: Session = Depends(get_db)
+) -> dict[str, bool]:
+    """LiveKit Cloud 的 webhook(Settings → Webhooks 配置,签名 key 用本服务的 API key)。
+
+    用户离开房间(挂断、关页面、断网超时都会触发)时,给还没结束时间的会话补上;
+    已经由挂断保存记过的不动。其余事件只回 200。"""
+    body = (await request.body()).decode()
+    receiver = lk_api.WebhookReceiver(
+        lk_api.TokenVerifier(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    )
+    try:
+        event = receiver.receive(body, authorization)
+    except Exception as e:
+        raise HTTPException(401, "invalid webhook signature") from e
+    p = event.participant
+    if event.event != "participant_left" or p.identity != CALLER_IDENTITY:
+        return {"ok": True}
+    sid = p.attributes.get(SESSION_ATTR, "")
+    s = db.get(SessionRow, int(sid)) if sid.isdigit() else None
+    if s is not None and s.ended_at is None:
+        s.ended_at = utcnow()
+        db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/auth/login")

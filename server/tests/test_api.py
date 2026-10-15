@@ -463,3 +463,131 @@ def test_unit_stats_requires_auth_and_isolates_users():
         main._github_login = lambda pat: "alice"
         token_b = login(c, user="alice")
         assert c.get("/api/units/stats", headers=auth(token_b)).json() == {}
+
+
+# ---------------------------------------------------------------- LiveKit webhook
+
+
+def token_attributes(client: TestClient, token: str) -> dict:
+    import jwt as pyjwt
+
+    r = client.post("/api/token", headers=auth(token))
+    assert r.status_code == 200, r.text
+    payload = pyjwt.decode(
+        r.json()["token"], options={"verify_signature": False}, algorithms=["HS256"]
+    )
+    return {"sessionId": r.json()["sessionId"], "attrs": payload.get("attributes", {})}
+
+
+def post_webhook(
+    client: TestClient,
+    event: str = "participant_left",
+    identity: str = "max",
+    attributes: dict | None = None,
+    secret: str | None = None,
+):
+    """按 LiveKit 的格式发一个签名 webhook:Authorization 是带 body sha256 的 JWT。"""
+    import base64
+    import hashlib
+
+    from google.protobuf.json_format import MessageToJson
+    from livekit import api as lk_api
+    from livekit.protocol import models as lk_models
+    from livekit.protocol import webhook as lk_webhook
+
+    ev = lk_webhook.WebhookEvent(
+        event=event,
+        id="EV_test",
+        created_at=int(time.time()),
+        room=lk_models.Room(name="tutor-max"),
+        participant=lk_models.ParticipantInfo(
+            identity=identity, attributes=attributes or {}
+        ),
+    )
+    body = MessageToJson(ev)
+    sha = base64.b64encode(hashlib.sha256(body.encode()).digest()).decode()
+    jwt_token = (
+        lk_api.AccessToken(main.LIVEKIT_API_KEY, secret or main.LIVEKIT_API_SECRET)
+        .with_sha256(sha)
+        .to_jwt()
+    )
+    return client.post(
+        "/api/livekit/webhook",
+        content=body,
+        headers={
+            "Authorization": jwt_token,
+            "Content-Type": "application/webhook+json",
+        },
+    )
+
+
+def ended_at(sid: int):
+    with SessionLocal() as db:
+        return db.get(main.SessionRow, sid).ended_at
+
+
+def test_room_token_carries_session_id_attribute():
+    with make_client() as c:
+        info = token_attributes(c, login(c))
+        assert info["attrs"] == {"session_id": str(info["sessionId"])}
+
+
+def test_webhook_participant_left_fills_ended_at():
+    with make_client() as c:
+        token = login(c)
+        sid = start_session(c, token)
+        assert ended_at(sid) is None
+        r = post_webhook(c, attributes={"session_id": str(sid)})
+        assert r.status_code == 200, r.text
+        assert ended_at(sid) is not None
+
+
+def test_webhook_then_put_keeps_end_time_and_saves_content():
+    with make_client() as c:
+        token = login(c)
+        sid = start_session(c, token)
+        post_webhook(c, attributes={"session_id": str(sid)})
+        first = ended_at(sid)
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        assert ended_at(sid) == first
+        assert c.get("/api/sessions", headers=auth(token)).json()[0]["msgs"] == 2
+
+
+def test_webhook_does_not_override_saved_end_time():
+    with make_client() as c:
+        token = login(c)
+        sid = start_session(c, token)
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        saved = ended_at(sid)
+        post_webhook(c, attributes={"session_id": str(sid)})
+        assert ended_at(sid) == saved
+
+
+def test_webhook_rejects_bad_signature():
+    with make_client() as c:
+        sid = start_session(c, login(c))
+        r = post_webhook(
+            c,
+            attributes={"session_id": str(sid)},
+            secret="wrong-secret-0123456789abcdef",
+        )
+        assert r.status_code == 401
+        assert ended_at(sid) is None
+
+
+def test_webhook_ignores_unrelated_events():
+    with make_client() as c:
+        sid = start_session(c, login(c))
+        attrs = {"session_id": str(sid)}
+        # 别的事件 / agent 离开 / 没带会话 id / 不存在的 id:都只回 200,不动数据
+        assert (
+            post_webhook(c, event="participant_joined", attributes=attrs).status_code
+            == 200
+        )
+        assert (
+            post_webhook(c, identity="agent-AJ_x", attributes=attrs).status_code == 200
+        )
+        assert post_webhook(c).status_code == 200
+        assert post_webhook(c, attributes={"session_id": "999999"}).status_code == 200
+        assert post_webhook(c, attributes={"session_id": "abc"}).status_code == 200
+        assert ended_at(sid) is None
