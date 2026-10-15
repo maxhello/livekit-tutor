@@ -315,3 +315,36 @@ def test_oauth_callback_rejects_user_not_in_allowlist():
             f"/api/auth/github/callback?code=abc&state={state}", follow_redirects=False
         )
         assert r.status_code == 403
+
+
+def _oauth_login_via(c: TestClient, redirect: str | None) -> str:
+    """走一遍 OAuth(带/不带 redirect),返回最终跳回的地址。"""
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    q = f"?{urlencode({'redirect': redirect})}" if redirect is not None else ""
+    r = c.get(f"/api/auth/github{q}", follow_redirects=False)
+    state = parse_qs(urlparse(r.headers["location"]).query)["state"][0]
+    main._exchange_code = lambda code: "gh-access-token"
+    main._github_login = lambda pat: "maxhello"
+    r = c.get(
+        f"/api/auth/github/callback?code=abc&state={state}", follow_redirects=False
+    )
+    assert r.status_code in (302, 307), r.text
+    return r.headers["location"]
+
+
+def test_oauth_returns_to_allowed_dev_origin():
+    with make_client() as c:
+        loc = _oauth_login_via(c, "http://localhost:5173/livekit-tutor/")
+        assert loc.startswith("http://localhost:5173/livekit-tutor/#gh=")
+
+
+def test_oauth_ignores_foreign_redirect():
+    with make_client() as c:
+        loc = _oauth_login_via(c, "https://evil.example/steal")
+        assert loc.startswith("https://front.test/#gh=")
+
+
+def test_oauth_without_redirect_goes_to_frontend():
+    with make_client() as c:
+        assert _oauth_login_via(c, None).startswith("https://front.test/#gh=")

@@ -19,7 +19,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException
@@ -187,8 +187,17 @@ def _oauth_redirect_uri() -> str:
     return f"{API_PUBLIC_URL}/api/auth/github/callback"
 
 
+def _safe_return_url(url: str | None) -> str:
+    """授权完跳回的页面:只认 CORS_ORIGINS 里的来源(如本地 dev),否则回线上前端,防任意跳转。"""
+    if url:
+        parts = urlsplit(url)
+        if f"{parts.scheme}://{parts.netloc}" in CORS_ORIGINS:
+            return f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+    return FRONTEND_URL
+
+
 @app.get("/api/auth/github")
-def github_auth() -> RedirectResponse:
+def github_auth(redirect: str = "") -> RedirectResponse:
     if not (
         GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET and API_PUBLIC_URL and FRONTEND_URL
     ):
@@ -206,6 +215,15 @@ def github_auth() -> RedirectResponse:
     # state 存 HttpOnly cookie 防 CSRF;SameSite=Lax 在顶级跳转下仍会带上
     resp.set_cookie(
         "gh_state", state, max_age=600, httponly=True, samesite="lax", secure=True
+    )
+    # 从哪个前端发起就跳回哪个(本地 dev 也能登录);回调时再校验一次
+    resp.set_cookie(
+        "gh_return",
+        _safe_return_url(redirect),
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=True,
     )
     return resp
 
@@ -237,6 +255,7 @@ def github_callback(
     code: str = "",
     state: str = "",
     gh_state: str | None = Cookie(None),
+    gh_return: str | None = Cookie(None),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
     if not code or not state or not gh_state:
@@ -252,8 +271,10 @@ def github_callback(
         row = UserRow(github_login=login_name)
         db.add(row)
         db.commit()
-    resp = RedirectResponse(f"{FRONTEND_URL}/#gh={make_token(row)}&user={login_name}")
+    back = _safe_return_url(gh_return)
+    resp = RedirectResponse(f"{back}/#gh={make_token(row)}&user={login_name}")
     resp.delete_cookie("gh_state")
+    resp.delete_cookie("gh_return")
     return resp
 
 
