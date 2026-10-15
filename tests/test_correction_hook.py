@@ -8,6 +8,7 @@ import json
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 from livekit.agents import llm
 
 from agent.main import Assistant
@@ -62,6 +63,17 @@ class FakePublisher:
         self.published.append((topic, json.loads(payload)))
 
 
+# 打在 Assistant 类上的 session 补丁:每个用例结束必须撤掉,否则会漏进后续测试
+_patchers: list = []
+
+
+@pytest.fixture(autouse=True)
+def _stop_session_patches():
+    yield
+    while _patchers:
+        _patchers.pop().stop()
+
+
 def make_assistant(analyzer: StubLLM) -> tuple[Assistant, FakePublisher]:
     a = Assistant(analyzer_llm=analyzer)  # type: ignore[arg-type]
     a._session_started_monotonic = asyncio.get_event_loop().time()
@@ -73,6 +85,7 @@ def make_assistant(analyzer: StubLLM) -> tuple[Assistant, FakePublisher]:
         Assistant, "session", new_callable=mock.PropertyMock, return_value=fake_session
     )
     patcher.start()
+    _patchers.append(patcher)
     return a, publisher
 
 

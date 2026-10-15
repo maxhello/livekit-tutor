@@ -15,10 +15,11 @@
 """
 
 import datetime
+import json
 import os
 import secrets
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -28,8 +29,8 @@ from fastapi.responses import RedirectResponse
 from livekit import api as lk_api
 from livekit.protocol import agent_dispatch as lk_dispatch
 from livekit.protocol.room import RoomConfiguration
-from pydantic import BaseModel
-from sqlalchemy import exists, select
+from pydantic import BaseModel, Field
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from auth import GITHUB_ALLOWLIST, JWT_SECRET, _github_login, current_user, make_token
@@ -110,9 +111,48 @@ class CorrectionIn(BaseModel):
 
 
 class SessionIn(BaseModel):
-    scenario: str = ""
     msgs: list[MsgIn]
     corrections: list[CorrectionIn] = []
+
+
+# 单元练习材料由前端(读多邻国单元指南)传来,原样转给 Emma:限长防撑爆 prompt
+Short = Annotated[str, Field(max_length=200)]
+
+
+class SentenceIn(BaseModel):
+    en: Short
+    zh: Short = ""
+
+
+class GrammarIn(BaseModel):
+    title: Short
+    examples: Annotated[list[Short], Field(max_length=3)] = []
+
+
+class UnitIn(BaseModel):
+    index: Annotated[int, Field(ge=0, le=10_000)]
+    label: Annotated[str, Field(max_length=60)] = ""
+    objective: Short = ""
+    sentences: Annotated[list[SentenceIn], Field(min_length=1, max_length=10)]
+    grammar: Annotated[list[GrammarIn], Field(max_length=3)] = []
+
+
+class TokenIn(BaseModel):
+    """开练参数:场景优先;两者都没有就是自由聊天。"""
+
+    scenario: Annotated[str, Field(max_length=100)] = ""
+    unit: UnitIn | None = None
+
+
+def practice_of(body: TokenIn | None) -> dict[str, Any] | None:
+    """本次练什么:写进 agent dispatch metadata,Emma 进房前就知道。"""
+    if body is None:
+        return None
+    if body.scenario.strip():
+        return {"mode": "scenario", "scenario": body.scenario.strip()}
+    if body.unit is not None:
+        return {"mode": "unit", "unit": body.unit.model_dump()}
+    return None
 
 
 # ---------------------------------------------------------------- app
@@ -138,12 +178,17 @@ def health() -> dict[str, bool]:
 
 @app.post("/api/token")
 def livekit_token(
-    user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
+    body: TokenIn | None = None,
+    user: UserRow = Depends(auth_dep),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """签一个短时房间 token(内嵌 agent dispatch,Emma 自动进房),同时建一条会话
-    (开始时间取服务器时间),返回 sessionId 供挂断时保存。需登录。"""
+    (开始时间取服务器时间),返回 sessionId 供挂断时保存。需登录。
+
+    body 带本次练习内容(场景或多邻国单元),经 dispatch metadata 交给 Emma。"""
     if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise HTTPException(500, "LiveKit credentials not configured")
+    practice = practice_of(body)
     token = (
         lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(CALLER_IDENTITY)
@@ -152,11 +197,23 @@ def livekit_token(
         .with_ttl(ROOM_TOKEN_TTL)
         .with_room_config(
             RoomConfiguration(
-                agents=[lk_dispatch.RoomAgentDispatch(agent_name=AGENT_NAME)],
+                agents=[
+                    lk_dispatch.RoomAgentDispatch(
+                        agent_name=AGENT_NAME,
+                        metadata=json.dumps(practice, ensure_ascii=False)
+                        if practice
+                        else "",
+                    )
+                ],
             )
         )
     )
     session = SessionRow(user_id=user.id)
+    if practice and practice["mode"] == "scenario":
+        session.scenario = practice["scenario"]
+    elif practice and practice["mode"] == "unit":
+        session.unit_index = practice["unit"]["index"]
+        session.unit_label = practice["unit"]["label"]
     db.add(session)
     db.commit()
     return {"token": token.to_jwt(), "url": LIVEKIT_URL, "sessionId": session.id}
@@ -295,6 +352,8 @@ def _session_out(s: SessionRow) -> dict[str, Any]:
         "startedAt": _ms(s.started_at),
         "seconds": _seconds(s),
         "scenario": s.scenario,
+        "unitIndex": s.unit_index,
+        "unitLabel": s.unit_label,
         "msgs": len(s.messages),
         "corrections": len(s.corrections),
     }
@@ -306,6 +365,8 @@ def _session_detail(s: SessionRow) -> dict[str, Any]:
         "startedAt": _ms(s.started_at),
         "seconds": _seconds(s),
         "scenario": s.scenario,
+        "unitIndex": s.unit_index,
+        "unitLabel": s.unit_label,
         "msgs": [{"role": m.role, "text": m.text} for m in s.messages],
         "corrections": [
             {
@@ -330,17 +391,39 @@ def _find_session(db: Session, user: UserRow, session_id: int) -> SessionRow:
 
 @app.get("/api/sessions")
 def list_sessions(
-    user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
+    unit: int | None = None,
+    user: UserRow = Depends(auth_dep),
+    db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    # 连上就断、一句话没说的会话不列出
-    has_msgs = exists().where(MessageRow.session_id == SessionRow.id)
+    # 连上就断、一句话没说的会话不列出;?unit=N 只看练该单元的
+    q = select(SessionRow).where(SessionRow.user_id == user.id, _has_msgs())
+    if unit is not None:
+        q = q.where(SessionRow.unit_index == unit)
     rows = db.scalars(
-        select(SessionRow)
-        .where(SessionRow.user_id == user.id, has_msgs)
-        .order_by(SessionRow.started_at.desc(), SessionRow.id.desc())
-        .limit(LIST_LIMIT)
+        q.order_by(SessionRow.started_at.desc(), SessionRow.id.desc()).limit(LIST_LIMIT)
     ).all()
     return [_session_out(s) for s in rows]
+
+
+def _has_msgs() -> Any:
+    return exists().where(MessageRow.session_id == SessionRow.id)
+
+
+@app.get("/api/units/stats")
+def unit_stats(
+    user: UserRow = Depends(auth_dep), db: Session = Depends(get_db)
+) -> dict[str, int]:
+    """每个多邻国单元练了几次(只算有对话的会话);站点学习路径页标「练过 N 次」用。"""
+    rows = db.execute(
+        select(SessionRow.unit_index, func.count())
+        .where(
+            SessionRow.user_id == user.id,
+            SessionRow.unit_index.is_not(None),
+            _has_msgs(),
+        )
+        .group_by(SessionRow.unit_index)
+    ).all()
+    return {str(idx): n for idx, n in rows}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -361,7 +444,6 @@ def put_session(
     s = _find_session(db, user, session_id)
     if s.ended_at is None:
         s.ended_at = utcnow()
-    s.scenario = body.scenario
     s.messages = [
         MessageRow(idx=i, role=m.role, text=m.text) for i, m in enumerate(body.msgs)
     ]

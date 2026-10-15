@@ -1,3 +1,5 @@
+import type { UnitBrief } from './units'
+
 /**
  * 后端 API 客户端(后端见 server/main.py)。
  *
@@ -21,9 +23,8 @@ export type Correction = {
   at: number // 距会话开始毫秒
 }
 
-/** 挂断时上传的会话内容;会话 id、起止时间都由后端生成 */
+/** 挂断时上传的会话内容;会话 id、起止时间、练习内容都在开练时由后端记下 */
 export type SessionPayload = {
-  scenario: string
   msgs: { role: 'emma' | 'me'; text: string }[]
   corrections: Correction[]
 }
@@ -32,6 +33,9 @@ export type SessionPayload = {
 export type SessionSummary = {
   id: number
   startedAt: number
+  /** 练的多邻国单元;练场景/自由聊天时为 null */
+  unitIndex: number | null
+  unitLabel: string
   seconds: number
   scenario: string
   msgs: number
@@ -39,7 +43,14 @@ export type SessionSummary = {
 }
 
 /** 详情(含正文与纠错卡) */
-export type SessionDetail = SessionPayload & { id: number; startedAt: number; seconds: number }
+export type SessionDetail = SessionPayload & {
+  id: number
+  startedAt: number
+  seconds: number
+  scenario: string
+  unitIndex: number | null
+  unitLabel: string
+}
 
 /** 每个账号的 JWT 分开存 */
 const tokenKey = (user: string) => `tutor-api-token:${user}`
@@ -164,9 +175,17 @@ export async function putSession(
 /**
  * 现领一个短时 LiveKit 房间 token(内嵌 agent dispatch,Emma 自动进房)。需登录。
  * 后端同时建好本次会话(开始时间取服务器时间),返回 sessionId 供挂断时保存。
+ * practice 是本次练什么(场景优先,其次多邻国单元),后端写进 agent dispatch 交给 Emma。
  */
 export function fetchRoomToken(
   account: Account,
+  practice: { scenario?: string; unit?: UnitBrief },
 ): Promise<{ token: string; url: string; sessionId: number }> {
-  return json(account, 'POST', '/api/token')
+  return json(account, 'POST', '/api/token', practice)
+}
+
+/** 每个多邻国单元练过几次 {unitIndex: n}(只算有对话的会话) */
+export async function getUnitStats(account: Account): Promise<Record<number, number>> {
+  const raw = await json<Record<string, number>>(account, 'GET', '/api/units/stats')
+  return Object.fromEntries(Object.entries(raw).map(([k, v]) => [Number(k), v]))
 }

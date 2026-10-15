@@ -37,6 +37,12 @@ from agent.corrections import (
     parse_correction_card,
     should_analyze,
 )
+from agent.practice import (
+    Practice,
+    opening_instructions,
+    parse_practice,
+    practice_instructions,
+)
 
 logger = logging.getLogger("agent")
 
@@ -44,7 +50,11 @@ load_dotenv(".env.local")
 
 
 class Assistant(Agent):
-    def __init__(self, analyzer_llm: llm.LLM | None = None) -> None:
+    def __init__(
+        self,
+        practice: Practice | None = None,
+        analyzer_llm: llm.LLM | None = None,
+    ) -> None:
         super().__init__(
             # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
             # See all available models at https://docs.livekit.io/agents/models/llm/
@@ -109,8 +119,11 @@ class Assistant(Agent):
                 - For medical, legal, or financial topics, provide general information only and suggest consulting a qualified professional.
                 - Protect privacy and minimize sensitive data.
                 """
-            ),
+            )
+            # 今日练习(场景/多邻国单元),经 dispatch metadata 从页面传来;自由聊天时为空
+            + practice_instructions(practice),
         )
+        self._practice = practice
         # 后台分析模型(便宜的小模型):出错/超时都不影响语音通话
         self._analyzer_llm = analyzer_llm or inference.LLM(model=ANALYZER_MODEL)
         self._analysis_tasks: set[asyncio.Task] = set()  # 持引用,防任务被 GC
@@ -120,6 +133,8 @@ class Assistant(Agent):
 
     async def on_enter(self) -> None:
         self._session_started_monotonic = time.monotonic()
+        # Emma 主动开场:有练习内容直接切入(场景入戏/单元话题),否则问想练什么
+        self.session.generate_reply(instructions=opening_instructions(self._practice))
 
     def stt_node(
         self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
@@ -214,10 +229,7 @@ class Assistant(Agent):
 
 server = AgentServer()
 
-# 场景播报等一次性后台任务:持引用防被 GC 中途回收
-_say_tasks: set[asyncio.Task] = set()
-
-# 头像后台重试任务:同样持引用
+# 头像后台重试任务:持引用防被 GC 中途回收
 _avatar_retry_tasks: set[asyncio.Task] = set()
 
 
@@ -387,9 +399,13 @@ async def my_agent(ctx: JobContext):
             _avatar_retry_tasks.add(t)
             t.add_done_callback(_avatar_retry_tasks.discard)
 
+    # 今日练习内容:页面开练时由后端写进 dispatch metadata(场景优先,其次多邻国单元)
+    practice = parse_practice(ctx.job.metadata)
+    logger.info(f"practice: {practice}")
+
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(),
+        agent=Assistant(practice=practice),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -401,28 +417,6 @@ async def my_agent(ctx: JobContext):
             audio_output=not use_simli,
         ),
     )
-
-    # 页面把"今日场景"经 data channel 推来(topic=scenario):直接开场入戏;
-    # 没收到时由 instructions 兜底:Emma 语音先问学生今天想练什么(可中文答)
-    @ctx.room.on("data_received")
-    def on_scenario(dp: rtc.DataPacket) -> None:
-        if dp.topic != "scenario":
-            return
-        try:
-            scenario = (json.loads(dp.payload.decode()) or {}).get("scenario", "")
-        except Exception:
-            return
-        scenario = str(scenario).strip()
-        if not scenario:
-            return
-        logger.info(f"scenario from web: {scenario}")
-        t = asyncio.create_task(
-            session.say(
-                f"Great choice! Today we are practicing {scenario}. Let's start."
-            )
-        )
-        _say_tasks.add(t)
-        t.add_done_callback(_say_tasks.discard)
 
     # Join the room and connect to the user
     await ctx.connect()

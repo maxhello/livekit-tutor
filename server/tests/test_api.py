@@ -35,16 +35,15 @@ def auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def start_session(client: TestClient, token: str) -> int:
+def start_session(client: TestClient, token: str, body: dict | None = None) -> int:
     """开练:领房间 token,后端顺带建会话并返回 sessionId。"""
-    r = client.post("/api/token", headers=auth(token))
+    r = client.post("/api/token", headers=auth(token), json=body)
     assert r.status_code == 200, r.text
     return r.json()["sessionId"]
 
 
 def sample_payload() -> dict:
     return {
-        "scenario": "ordering coffee",
         "msgs": [
             {"role": "emma", "text": "Hi! What would you like?"},
             {"role": "me", "text": "I want a coffee"},
@@ -120,7 +119,7 @@ def test_each_start_gets_a_new_id():
 def test_put_list_get_roundtrip():
     with make_client() as c:
         token = login(c)
-        sid = start_session(c, token)
+        sid = start_session(c, token, {"scenario": "ordering coffee"})
         put = c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
         assert put.status_code == 200, put.text
 
@@ -348,3 +347,119 @@ def test_oauth_ignores_foreign_redirect():
 def test_oauth_without_redirect_goes_to_frontend():
     with make_client() as c:
         assert _oauth_login_via(c, None).startswith("https://front.test/#gh=")
+
+
+# ---------------------------------------------------------------- 多邻国单元练习
+
+
+def sample_unit(index: int = 45) -> dict:
+    return {
+        "index": index,
+        "label": "第3阶段 第6部分",
+        "objective": "讨论对超级碗的喜好",
+        "sentences": [
+            {"en": "I love watching sports.", "zh": "我非常喜欢看体育比赛。"},
+            {"en": "The Super Bowl is a big game.", "zh": "超级碗是一场大比赛。"},
+        ],
+        "grammar": [{"title": "like + doing", "examples": ["I like watching TV."]}],
+    }
+
+
+def dispatch_metadata(client: TestClient, token: str, body: dict | None) -> str:
+    import jwt as pyjwt
+
+    r = client.post("/api/token", headers=auth(token), json=body)
+    assert r.status_code == 200, r.text
+    payload = pyjwt.decode(
+        r.json()["token"], options={"verify_signature": False}, algorithms=["HS256"]
+    )
+    return payload["roomConfig"]["agents"][0].get("metadata", "")
+
+
+def test_unit_goes_into_dispatch_metadata():
+    import json
+
+    with make_client() as c:
+        token = login(c)
+        meta = json.loads(dispatch_metadata(c, token, {"unit": sample_unit()}))
+        assert meta["mode"] == "unit"
+        assert meta["unit"]["index"] == 45
+        assert meta["unit"]["sentences"][0]["en"] == "I love watching sports."
+
+
+def test_scenario_wins_over_unit():
+    import json
+
+    with make_client() as c:
+        token = login(c)
+        meta = json.loads(
+            dispatch_metadata(
+                c, token, {"scenario": "ordering coffee", "unit": sample_unit()}
+            )
+        )
+        assert meta == {"mode": "scenario", "scenario": "ordering coffee"}
+
+
+def test_no_practice_means_free_chat():
+    with make_client() as c:
+        token = login(c)
+        assert dispatch_metadata(c, token, None) == ""
+        assert dispatch_metadata(c, token, {"scenario": "  "}) == ""
+
+
+def test_rejects_oversized_unit():
+    with make_client() as c:
+        token = login(c)
+        too_many = sample_unit()
+        too_many["sentences"] = [{"en": f"Sentence {i}."} for i in range(11)]
+        too_long = sample_unit()
+        too_long["sentences"][0]["en"] = "x" * 201
+        no_sentences = sample_unit()
+        no_sentences["sentences"] = []
+        for unit in (too_many, too_long, no_sentences):
+            r = c.post("/api/token", headers=auth(token), json={"unit": unit})
+            assert r.status_code == 422
+
+
+def test_unit_recorded_on_session_and_filterable():
+    with make_client() as c:
+        token = login(c)
+        u45 = start_session(c, token, {"unit": sample_unit(45)})
+        u44 = start_session(c, token, {"unit": sample_unit(44)})
+        for sid in (u45, u44):
+            c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+
+        detail = c.get(f"/api/sessions/{u45}", headers=auth(token)).json()
+        assert detail["unitIndex"] == 45
+        assert detail["unitLabel"] == "第3阶段 第6部分"
+        only45 = c.get("/api/sessions?unit=45", headers=auth(token)).json()
+        assert [s["id"] for s in only45] == [u45]
+
+
+def test_unit_stats_counts_only_sessions_with_messages():
+    with make_client() as c:
+        token = login(c)
+        for _ in range(2):
+            sid = start_session(c, token, {"unit": sample_unit(45)})
+            c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        start_session(c, token, {"unit": sample_unit(45)})  # 连上就断,不算
+        sid = start_session(c, token, {"unit": sample_unit(44)})
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+        sid = start_session(c, token, {"scenario": "ordering coffee"})
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token))
+
+        assert c.get("/api/units/stats", headers=auth(token)).json() == {
+            "45": 2,
+            "44": 1,
+        }
+
+
+def test_unit_stats_requires_auth_and_isolates_users():
+    with make_client() as c:
+        assert c.get("/api/units/stats").status_code == 401
+        token_a = login(c)
+        sid = start_session(c, token_a, {"unit": sample_unit(45)})
+        c.put(f"/api/sessions/{sid}", json=sample_payload(), headers=auth(token_a))
+        main._github_login = lambda pat: "alice"
+        token_b = login(c, user="alice")
+        assert c.get("/api/units/stats", headers=auth(token_b)).json() == {}

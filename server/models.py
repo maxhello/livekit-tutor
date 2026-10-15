@@ -45,6 +45,9 @@ class SessionRow(Base):
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scenario: Mapped[str] = mapped_column(default="")
+    # 练的多邻国单元(0-based 全局编号 + 展示用标签);练场景/自由聊天时为空
+    unit_index: Mapped[int | None] = mapped_column(index=True)
+    unit_label: Mapped[str] = mapped_column(default="")
     created_at: Mapped[datetime] = mapped_column(
         default=lambda: datetime.now(timezone.utc)
     )

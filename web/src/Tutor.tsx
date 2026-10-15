@@ -11,6 +11,7 @@ import History from './History'
 import {
   consumeOAuthHash,
   fetchRoomToken,
+  getUnitStats,
   githubAuthUrl,
   putSession,
   saveApiToken,
@@ -18,6 +19,8 @@ import {
   type Correction,
   type SessionPayload,
 } from './api'
+import UnitDrawer from './UnitDrawer'
+import { loadUnits, unitBrief, unitLabel, type UnitData } from './units'
 
 /** GitHub 账号列表(写历史凭证)与当前登录者,存 localStorage */
 const ACCOUNTS_KEY = 'tutor-accounts'
@@ -25,11 +28,15 @@ const CURRENT_KEY = 'tutor-current'
 /** 我方 participant identity(后端签 token 时写死),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v11'
+const APP_VERSION = 'v12'
 /** 挂断自动保存的最多尝试次数 */
 const SAVE_ATTEMPTS = 3
 /** 新纠错提示在视频上停留的毫秒数 */
 const TOAST_MS = 5000
+/** 页面参数:?unit=N 练指定单元;?history=unit:N 打开历史并只看该单元(站点学习路径页跳来) */
+const PARAMS = new URLSearchParams(location.search)
+const PARAM_UNIT = PARAMS.has('unit') ? Number(PARAMS.get('unit')) : null
+const PARAM_HISTORY_UNIT = /^unit:(\d+)$/.exec(PARAMS.get('history') ?? '')?.[1]
 /** 首页场景快捷按钮:点一下填进场景输入框 */
 const SCENARIO_CHIPS = ['点咖啡', '问路', '自我介绍', '超市购物', '等公交']
 
@@ -204,11 +211,20 @@ function ClockIcon() {
 /**
  * AI 英语陪练页:开始练习时向后端现领短时 LiveKit token(token 里带 agent dispatch,
  * Emma 自动进房),双人短句教学;纠错卡经 data channel 实时推送。
- * 首页(开始 + 场景 + 历史抽屉)与通话页(全屏视频舞台 + 对话/错题本侧栏)两个界面。
+ * 练什么:场景优先;没选场景就练多邻国单元(默认当前单元,可换已学单元复习),
+ * 单元数据打开页面时从个人站点仓库实时读取(units.ts),随 token 请求交给后端→Emma。
+ * 首页(单元 + 场景 + 历史抽屉)与通话页(全屏视频舞台 + 对话/错题本侧栏)两个界面。
  */
 export default function Tutor() {
-  /** 今日练习场景(可选):连接后经 data channel 推给 Emma 直接入戏;留空则她语音问你 */
+  /** 今日练习场景(可选):开练时随 token 请求交给 Emma 直接入戏;优先于单元 */
   const [scenario, setScenario] = useState('')
+  /** 多邻国单元数据(读不到时为 null,隐藏单元卡片);选中的单元编号 */
+  const [unitData, setUnitData] = useState<UnitData | null>(null)
+  const [unitIdx, setUnitIdx] = useState<number | null>(null)
+  /** 单元抽屉:列表 + 详情(指南)合一,本页打开不跳走 */
+  const [showUnits, setShowUnits] = useState(false)
+  /** 每个单元练过几次(换单元列表里显示;未登录为 null) */
+  const [practiced, setPracticed] = useState<Record<number, number> | null>(null)
   /** 当前登录账号(GitHub OAuth);null 表示未登录 */
   const [current, setCurrent] = useState<Account | null>(() => {
     try {
@@ -218,7 +234,7 @@ export default function Tutor() {
       return null
     }
   })
-  const [showHistory, setShowHistory] = useState(false)
+  const [showHistory, setShowHistory] = useState(PARAM_HISTORY_UNIT != null)
   /** 通知 History 重新拉取:会话保存成功时 +1 */
   const [historyTick, setHistoryTick] = useState(0)
   const [status, setStatus] = useState<Status>('idle')
@@ -242,7 +258,8 @@ export default function Tutor() {
   /** 本次会话 id:后端签房间 token 时建好(开始时间也取服务器时间) */
   const sessionIdRef = useRef<number | null>(null)
   const accountRef = useRef<Account | null>(null)
-  const scenarioRef = useRef('')
+  /** 通话页顶部显示的练习内容(场景名或单元) */
+  const practiceRef = useRef('')
   const endedRef = useRef(true)
   const videoElRef = useRef<HTMLVideoElement | null>(null)
   /** 头像视频轨:<video> 挂载后直接 attach(不经隐藏元素,避免双元素黑屏) */
@@ -259,6 +276,28 @@ export default function Tutor() {
   useEffect(() => {
     document.title = 'AI English Tutor'
   }, [])
+
+  // 读多邻国单元:默认当前单元,?unit=N 且可练时用它
+  useEffect(() => {
+    loadUnits()
+      .then((d) => {
+        setUnitData(d)
+        const wanted = d.units.find((u) => u.unitIndex === PARAM_UNIT)
+        setUnitIdx(wanted?.unitIndex ?? d.units[0]?.unitIndex ?? null)
+      })
+      .catch(() => setUnitData(null)) // 读不到就只有场景/自由聊天
+  }, [])
+
+  // 登录后、每次保存完会话后刷新各单元练习次数
+  useEffect(() => {
+    if (!current) {
+      setPracticed(null)
+      return
+    }
+    getUnitStats(current)
+      .then(setPracticed)
+      .catch(() => setPracticed(null))
+  }, [current, historyTick])
 
   // OAuth 回跳:hash 里带 #gh=<jwt>&user=<login>,存下并设为当前账号(读完即清)
   useEffect(() => {
@@ -354,7 +393,6 @@ export default function Tutor() {
     const snapshot = msgsRef.current
     if (id == null || !account || !snapshot.length) return
     void saveSession(account, id, {
-      scenario: scenarioRef.current,
       msgs: snapshot.map(({ role, text }) => ({ role, text })),
       corrections: correctionsRef.current,
     })
@@ -462,7 +500,18 @@ export default function Tutor() {
     })
     try {
       // 每次开练都向后端现领一个短时 token(密钥只在服务端,不再手工粘贴)
-      const { token: roomToken, url, sessionId } = await fetchRoomToken(current)
+      // 练什么:场景优先,其次选中的单元,都没有就自由聊天(Emma 先问你想练什么)
+      const sc = scenario.trim()
+      const unit = sc ? undefined : unitData?.units.find((u) => u.unitIndex === unitIdx)
+      practiceRef.current = sc
+        ? `场景:${sc}`
+        : unit
+          ? `${unitLabel(unit)} · ${unit.objective}`
+          : ''
+      const { token: roomToken, url, sessionId } = await fetchRoomToken(
+        current,
+        sc ? { scenario: sc } : unit ? { unit: unitBrief(unit) } : {},
+      )
       await room.connect(url, roomToken)
       await room.localParticipant.setMicrophoneEnabled(true)
       msgIndex.current.clear()
@@ -470,16 +519,8 @@ export default function Tutor() {
       correctionsRef.current = []
       sessionIdRef.current = sessionId
       accountRef.current = current
-      scenarioRef.current = scenario.trim()
       endedRef.current = false
       setStatus('connected')
-      // 有指定场景就推给 Emma(topic=scenario),她直接开场入戏
-      if (scenario.trim()) {
-        await room.localParticipant.publishData(
-          new TextEncoder().encode(JSON.stringify({ scenario: scenario.trim() })),
-          { reliable: true, topic: 'scenario' },
-        )
-      }
     } catch (e) {
       els.forEach((el) => el.remove())
       setStatus('idle')
@@ -533,7 +574,7 @@ export default function Tutor() {
             />
           )}
 
-          {/* 顶部:名字 + 计时 / 场景 */}
+          {/* 顶部:名字 + 计时 / 练习内容 */}
           <div className="absolute inset-x-4 top-4 flex items-center justify-between gap-3 lg:inset-x-5 lg:top-5">
             <div className="flex items-center gap-2.5 rounded-full bg-[#030712]/65 px-3.5 py-2 text-sm backdrop-blur">
               <span
@@ -542,9 +583,9 @@ export default function Tutor() {
               <span className="font-semibold">Emma</span>
               <span className="tabular-nums text-gray-400">{fmt(seconds)}</span>
             </div>
-            {scenarioRef.current && connected && (
+            {practiceRef.current && connected && (
               <div className="truncate rounded-full bg-[#030712]/65 px-3.5 py-2 text-[13px] text-slate-300 backdrop-blur">
-                场景:{scenarioRef.current}
+                {practiceRef.current}
               </div>
             )}
           </div>
@@ -673,6 +714,7 @@ export default function Tutor() {
   }
 
   // ---------------------------------------------------------------- 首页
+  const selectedUnit = unitData?.units.find((u) => u.unitIndex === unitIdx)
   return (
     <div className="relative flex min-h-dvh flex-col overflow-hidden bg-[radial-gradient(90%_70%_at_50%_30%,#0d1830_0%,#030712_70%)]">
       <header className="flex flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-7 sm:py-5">
@@ -716,8 +758,41 @@ export default function Tutor() {
         </div>
 
         <div className="flex w-full max-w-[520px] flex-col gap-3">
+          {selectedUnit && (
+            <div className="flex flex-col gap-1.5">
+              {/* 整张卡片就是入口:点开单元抽屉,直接看详情,也能换单元 */}
+              <button
+                onClick={() => setShowUnits(true)}
+                className={`group flex items-center gap-3 rounded-2xl border p-4 text-left transition-opacity ${
+                  scenario.trim()
+                    ? 'border-gray-800 bg-[#0b1220] opacity-50'
+                    : 'border-cyan-400/40 bg-cyan-400/5 hover:bg-cyan-400/10'
+                }`}
+              >
+                <span className="flex min-w-0 flex-1 flex-col gap-1">
+                  <span className="text-[13px] text-cyan-300">
+                    {selectedUnit.unitIndex === unitData?.current ? '当前单元' : '复习单元'} ·{' '}
+                    {unitLabel(selectedUnit)}
+                    {practiced?.[selectedUnit.unitIndex]
+                      ? ` · 练过 ${practiced[selectedUnit.unitIndex]} 次`
+                      : ''}
+                  </span>
+                  <span className="truncate text-[17px] font-semibold">{selectedUnit.objective}</span>
+                  <span className="text-[13px] text-gray-400">查看重点句和语法 · 换单元</span>
+                </span>
+                <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none text-gray-400 group-hover:text-gray-200">
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
+              </button>
+              {scenario.trim() && (
+                <p className="text-left text-[13px] text-amber-300">已选场景，本次练场景，不练单元</p>
+              )}
+            </div>
+          )}
           <label htmlFor="scenario" className="text-left text-sm text-slate-300">
-            今天练什么?(可选，留空 Emma 会问你)
+            {selectedUnit
+              ? '或者练一个场景(可选，选了就不练单元)'
+              : '今天练什么?(可选，留空 Emma 会问你)'}
           </label>
           <input
             id="scenario"
@@ -764,11 +839,27 @@ export default function Tutor() {
       {/* 部署版本:改前端时把上面的 APP_VERSION +1 */}
       <footer className="pb-4 text-center text-xs text-gray-600">deploy {APP_VERSION}</footer>
 
+      {showUnits && selectedUnit && unitData && (
+        <UnitDrawer
+          units={unitData.units}
+          current={unitData.current}
+          selected={selectedUnit.unitIndex}
+          ttsBase={unitData.ttsBase}
+          practiced={practiced}
+          onPick={(idx) => {
+            setUnitIdx(idx)
+            setShowUnits(false)
+          }}
+          onClose={() => setShowUnits(false)}
+        />
+      )}
+
       <History
         account={current}
         tick={historyTick}
         open={showHistory}
         onClose={() => setShowHistory(false)}
+        initialUnit={PARAM_HISTORY_UNIT != null ? Number(PARAM_HISTORY_UNIT) : null}
       />
     </div>
   )
