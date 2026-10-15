@@ -44,8 +44,12 @@ export type SessionDetail = SessionPayload & { id: number; startedAt: number; se
 /** 每个账号的 JWT 分开存 */
 const tokenKey = (user: string) => `tutor-api-token:${user}`
 
-/** GitHub OAuth 一键登录入口(整页跳转;回来时 URL hash 带 #gh=<jwt>&user=<login>) */
-export const GITHUB_AUTH_URL = `${API_BASE}/api/auth/github`
+/**
+ * GitHub OAuth 一键登录入口(整页跳转;回来时 URL hash 带 #gh=<jwt>&user=<login>)。
+ * 带上当前页面地址,授权完跳回这里(后端只认允许的来源,本地 dev 也能登录)。
+ */
+export const githubAuthUrl = () =>
+  `${API_BASE}/api/auth/github?redirect=${encodeURIComponent(location.origin + location.pathname)}`
 
 /** 保存某账号的后端 JWT(登录/续期后调用) */
 export function saveApiToken(user: string, token: string): void {
@@ -115,7 +119,7 @@ async function request(
       r = await doFetch(await login(account.user, account.token))
     } else {
       // OAuth 账号:30 天 JWT 过期,重新走一次授权
-      window.location.href = GITHUB_AUTH_URL
+      window.location.href = githubAuthUrl()
       throw new Error('登录已过期,正在重新跳转 GitHub 授权…')
     }
   }

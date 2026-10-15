@@ -6,7 +6,7 @@ import {
   getSession,
   listSessions,
 } from './api'
-import { CorrectionItem } from './Tutor'
+import { Bubble, CorrectionItem } from './Tutor'
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const fmtDate = (ts: number) => {
@@ -16,15 +16,19 @@ const fmtDate = (ts: number) => {
 const fmtDur = (s: number) => `${Math.floor(s / 60)}分${pad(s % 60)}秒`
 
 /**
- * 练习历史:全部来自后端(挂断时已自动保存),列表 + 点开气泡/纠错卡回看。
- * 不再写 localStorage —— 换浏览器/设备登录同账号看到的是同一份。
+ * 练习历史抽屉(首页右侧滑出):全部来自后端(挂断时已自动保存),列表 + 点开回看气泡/纠错卡。
+ * 不写 localStorage —— 换浏览器/设备登录同账号看到的是同一份。
  */
 export default function History({
   account,
   tick,
+  open,
+  onClose,
 }: {
   account: Account | null
   tick: number
+  open: boolean
+  onClose: () => void
 }) {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [loading, setLoading] = useState(false)
@@ -33,12 +37,9 @@ export default function History({
   const [expanded, setExpanded] = useState<number | null>(null)
   const [err, setErr] = useState('')
 
-  // 登录/切账号或有新会话保存成功(tick++)后重新拉列表
+  // 打开抽屉、切账号或有新会话保存成功(tick++)时重新拉列表
   useEffect(() => {
-    if (!account) {
-      setSessions([])
-      return
-    }
+    if (!account || !open) return
     let alive = true
     setLoading(true)
     setErr('')
@@ -49,7 +50,15 @@ export default function History({
     return () => {
       alive = false
     }
-  }, [account, tick])
+  }, [account, tick, open])
+
+  // Esc 关闭
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
 
   async function toggle(id: number) {
     if (expanded === id) {
@@ -66,74 +75,97 @@ export default function History({
     }
   }
 
-  if (!account) return null
+  if (!account || !open) return null
 
   return (
-    <section className="card mt-4 flex flex-col p-4">
-      <h2 className="mb-2 text-sm font-medium text-gray-300">📚 练习历史</h2>
-      {err && <p className="mb-2 text-xs text-rose-400/90">{err}</p>}
-      <div className="max-h-80 space-y-1.5 overflow-y-auto pr-1">
-        {sessions.length === 0 && (
-          <p className="py-4 text-center text-sm text-gray-500">
-            {loading ? '加载中…' : '还没有练习记录'}
-          </p>
-        )}
-        {sessions.map((s) => {
-          const detail = details[s.id]
-          return (
-            <div key={s.id}>
-              <button
-                onClick={() => toggle(s.id)}
-                className="flex w-full items-center gap-2 rounded-lg border border-gray-800/60 bg-gray-900/40 px-3 py-2 text-left text-xs"
-              >
-                <span className="shrink-0 text-gray-300">{fmtDate(s.startedAt)}</span>
-                {s.seconds > 0 && <span className="shrink-0 text-gray-500">{fmtDur(s.seconds)}</span>}
-                <span className="min-w-0 flex-1 truncate text-gray-400">
-                  {s.scenario || '自由聊天'}
-                </span>
-                {s.corrections > 0 && (
-                  <span
-                    className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300"
-                    title="纠错卡数"
-                  >
-                    ✍ {s.corrections}
-                  </span>
-                )}
-              </button>
-              {expanded === s.id && (
-                <div className="mt-1.5 space-y-1.5 rounded-lg bg-gray-900/60 p-3">
-                  {!detail ? (
-                    <p className="py-2 text-center text-xs text-gray-500">加载中…</p>
-                  ) : (
-                    <>
-                      {detail.msgs.map((m, i) => (
-                        <div key={i} className={m.role === 'me' ? 'text-right' : 'text-left'}>
-                          <span
-                            className={`inline-block max-w-[85%] rounded-xl px-3 py-1.5 text-sm ${
-                              m.role === 'me'
-                                ? 'bg-violet-500/15 text-violet-100'
-                                : 'bg-cyan-500/10 text-cyan-50'
-                            }`}
-                          >
-                            {m.text}
-                          </span>
-                        </div>
-                      ))}
-                      {detail.corrections.length > 0 && (
-                        <div className="mt-2 space-y-2 border-t border-gray-800/60 pt-2">
-                          {detail.corrections.map((c, i) => (
-                            <CorrectionItem key={i} c={c} />
-                          ))}
-                        </div>
-                      )}
-                    </>
+    <>
+      <div className="fixed inset-0 z-10 bg-[#030712]/55" onClick={onClose} />
+      <aside
+        aria-label="练习历史"
+        className="slide-in fixed inset-y-0 right-0 z-20 flex w-[420px] max-w-full flex-col border-l border-gray-800 bg-[#0b1220] shadow-[-24px_0_48px_rgba(0,0,0,.4)]"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-gray-800 px-5 pb-4 pt-5">
+          <h2 className="text-lg font-semibold">练习历史</h2>
+          <button
+            onClick={onClose}
+            aria-label="关闭"
+            className="flex size-10 items-center justify-center rounded-xl border border-gray-800 text-slate-300 hover:bg-slate-800/60"
+          >
+            <svg
+              aria-hidden="true"
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+            >
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+        {err && <p className="px-5 pt-3 text-sm text-rose-400">{err}</p>}
+        <div className="thin-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3.5">
+          {sessions.length === 0 && (
+            <p className="py-8 text-center text-sm text-gray-400">
+              {loading ? '加载中…' : '还没有练习记录'}
+            </p>
+          )}
+          {sessions.map((s) => {
+            const detail = details[s.id]
+            const isOpen = expanded === s.id
+            return (
+              <div key={s.id} className="flex flex-col gap-2">
+                <button
+                  onClick={() => toggle(s.id)}
+                  aria-expanded={isOpen}
+                  className={`flex items-center gap-3 rounded-2xl border px-3.5 py-3 text-left ${
+                    isOpen
+                      ? 'border-cyan-400/40 bg-[#10203a]'
+                      : 'border-[#1a2436] bg-[#0f1a2e] hover:border-gray-700'
+                  }`}
+                >
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div className="truncate text-[15px] font-medium">
+                      {s.scenario || '自由聊天'}
+                    </div>
+                    <div className="text-[13px] text-gray-400">
+                      {fmtDate(s.startedAt)}
+                      {s.seconds > 0 && ` · ${fmtDur(s.seconds)}`}
+                    </div>
+                  </div>
+                  {s.corrections > 0 && (
+                    <span className="shrink-0 rounded-md bg-amber-400/15 px-2 py-0.5 text-xs text-amber-300">
+                      {s.corrections} 错
+                    </span>
                   )}
-                </div>
-              )}
-            </div>
-          )
-        })}
-      </div>
-    </section>
+                </button>
+                {isOpen && (
+                  <div className="flex flex-col gap-3 rounded-2xl bg-[#08101e] p-3.5">
+                    {!detail ? (
+                      <p className="py-2 text-center text-sm text-gray-400">加载中…</p>
+                    ) : (
+                      <>
+                        {detail.msgs.map((m, i) => (
+                          <Bubble key={i} role={m.role} text={m.text} />
+                        ))}
+                        {detail.corrections.length > 0 && (
+                          <div className="mt-1 flex flex-col gap-2 border-t border-gray-800 pt-3">
+                            {detail.corrections.map((c, i) => (
+                              <CorrectionItem key={i} c={c} />
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </aside>
+    </>
   )
 }
