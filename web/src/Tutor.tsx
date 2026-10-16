@@ -28,7 +28,7 @@ const CURRENT_KEY = 'tutor-current'
 /** 我方 participant identity(后端签 token 时写死),转录按身份区分左右气泡 */
 const MY_IDENTITY = 'max'
 /** 前端版本号:每次改前端手动 +1,页脚展示,用于核对线上是否为最新部署 */
-const APP_VERSION = 'v12'
+const APP_VERSION = 'v13'
 /** 挂断自动保存的最多尝试次数 */
 const SAVE_ATTEMPTS = 3
 /** 新纠错提示在视频上停留的毫秒数 */
@@ -246,6 +246,8 @@ export default function Tutor() {
   const [speaking, setSpeaking] = useState<'emma' | 'me' | null>(null)
   /** 头像视频(Simli 开启时 agent 侧会发布视频轨) */
   const [avatarVideo, setAvatarVideo] = useState(false)
+  // Emma 的 agent 真正进房并开始工作(免费版冷启动要 10~20s,之前说话没人听)
+  const [agentReady, setAgentReady] = useState(false)
   const [tab, setTab] = useState<Tab>('chat')
   /** 视频上的新纠错提示 */
   const [toast, setToast] = useState<Correction | null>(null)
@@ -333,12 +335,6 @@ export default function Tutor() {
     },
     [],
   )
-
-  /** Emma 最新一句,叠在视频底部当字幕 */
-  const caption = useMemo(() => {
-    for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === 'emma') return msgs[i].text
-    return ''
-  }, [msgs])
 
   /** 被纠错的那句话(我说的):对话里标「已记入错题本」 */
   const flaggedIds = useMemo(() => {
@@ -433,8 +429,22 @@ export default function Tutor() {
     setShowHistory(false)
     setMsgs([])
     setCorrections([])
+    setAgentReady(false)
     const room = new Room()
     roomRef.current = room
+    // agent 的 lk.agent.state 离开 initializing 才算真在听;Simli 头像也是 agent
+    // 类参与者但没有这个属性,不会误判
+    const checkAgent = () => {
+      for (const p of room.remoteParticipants.values()) {
+        const st = p.attributes['lk.agent.state']
+        if (p.isAgent && st && st !== 'initializing') {
+          setAgentReady(true)
+          return
+        }
+      }
+    }
+    room.on(RoomEvent.ParticipantConnected, checkAgent)
+    room.on(RoomEvent.ParticipantAttributesChanged, checkAgent)
     const els: HTMLMediaElement[] = []
     room.on(RoomEvent.TrackSubscribed, (track) => {
       if (track.kind === Track.Kind.Audio) {
@@ -514,6 +524,7 @@ export default function Tutor() {
       )
       await room.connect(url, roomToken)
       await room.localParticipant.setMicrophoneEnabled(true)
+      checkAgent() // 进房前 agent 已在(热启动)时不会再有 connected 事件
       msgIndex.current.clear()
       msgsRef.current = []
       correctionsRef.current = []
@@ -557,10 +568,18 @@ export default function Tutor() {
             />
             <div className="flex flex-col items-center gap-1.5 text-center">
               <div className="text-lg font-semibold lg:text-xl">
-                {!connected ? '正在接通…' : emmaSpoke ? 'Emma' : 'Emma 正在上线…'}
+                {!connected
+                  ? '正在接通…'
+                  : !agentReady
+                    ? 'Emma 正在上线…'
+                    : emmaSpoke
+                      ? 'Emma'
+                      : 'Emma 马上开口…'}
               </div>
-              {connected && !emmaSpoke && (
-                <div className="text-sm text-gray-400">已经可以开口了，她能听到你</div>
+              {connected && !agentReady && (
+                <div className="text-sm text-gray-400">
+                  服务刚被唤醒，通常要 10～20 秒，她到之前先别说话
+                </div>
               )}
             </div>
           </div>
@@ -608,13 +627,8 @@ export default function Tutor() {
             </div>
           )}
 
-          {/* 底部:字幕 + 说话状态 + 挂断 */}
-          <div className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-3 bg-gradient-to-b from-transparent to-[#030712]/90 to-55% px-4 pb-4 pt-16 lg:gap-[18px] lg:px-8 lg:pb-7 lg:pt-20">
-            {caption && (
-              <p className="max-w-3xl text-center text-[19px] font-medium leading-snug text-slate-50 lg:text-[26px]">
-                {caption}
-              </p>
-            )}
+          {/* 底部:说话状态 + 挂断(字幕不叠在视频上,看侧栏对话) */}
+          <div className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-3 bg-gradient-to-b from-transparent to-[#030712]/70 px-4 pb-4 pt-8 lg:gap-[18px] lg:px-8 lg:pb-7 lg:pt-10">
             <div className="flex items-center gap-2.5 rounded-full bg-slate-900/80 px-4 py-2 text-sm">
               {speaking === 'emma' ? (
                 <>
@@ -628,7 +642,13 @@ export default function Tutor() {
                 </>
               ) : (
                 <span className="text-slate-300">
-                  {connected ? '轮到你了，直接开口' : '正在接通…'}
+                  {!connected
+                    ? '正在接通…'
+                    : !agentReady
+                      ? 'Emma 还在路上，先别开口'
+                      : !emmaSpoke
+                        ? 'Emma 马上开口…'
+                        : '轮到你了，直接开口'}
                 </span>
               )}
             </div>

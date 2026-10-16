@@ -34,7 +34,12 @@ class FakeAvatar:
 
 @pytest.fixture(autouse=True)
 def fast_polling(monkeypatch):
-    """槽位轮询间隔/等待上限调小,测试毫秒级跑完。"""
+    """槽位轮询间隔/等待上限调小,测试毫秒级跑完;进房结果由 FakeAvatar 决定。"""
+
+    async def fake_wait_joined(avatar, room):
+        await avatar.wait_for_join()
+
+    monkeypatch.setattr(main_mod, "_wait_avatar_joined", fake_wait_joined)
     monkeypatch.setattr(main_mod, "SIMLI_SLOT_POLL_INTERVAL", 0.01)
     monkeypatch.setattr(main_mod, "SIMLI_SLOT_WAIT_TIMEOUT", 0.05)
     FakeAvatar.instances = []
@@ -123,3 +128,29 @@ async def test_stops_when_shutting_down():
         )
     assert avatar is None
     assert len(FakeAvatar.instances) == 1  # 关闭后不再做第 2 次尝试
+
+
+async def test_first_instance_is_reused_not_restarted():
+    # session.start 前已 start 的首个实例:第 1 次只等它进房,不再新建/重复 start
+    first = FakeAvatar([False])
+    first.started = True
+    FakeAvatar.instances = []
+    with (
+        mock.patch.object(
+            main_mod, "_new_simli_avatar", lambda cfg: FakeAvatar([True])
+        ),
+        mock.patch.object(
+            main_mod, "_simli_slot_usage", mock.AsyncMock(return_value=0)
+        ),
+    ):
+        avatar = await main_mod.start_simli_avatar_with_retry(
+            session=SimpleNamespace(),
+            room=SimpleNamespace(),
+            simli_config=SimpleNamespace(),
+            api_key="test-key",
+            attempts=3,
+            first=first,
+        )
+    assert first.outcomes == []  # 第 1 次确实等的是它
+    assert len(FakeAvatar.instances) == 1  # 失败后只新建了 1 个重试实例
+    assert avatar is FakeAvatar.instances[0]

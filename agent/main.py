@@ -22,6 +22,7 @@ from livekit.agents import (
     room_io,
     stt,
 )
+from livekit.agents.beta.tools import EndCallTool
 from livekit.agents.utils import is_given
 from livekit.plugins import ai_coustics
 
@@ -102,6 +103,12 @@ class Assistant(Agent):
                 - If the student gets stuck, give them a short template of 3 to 4 words to repeat.
                 - Encourage naturally. Celebrate good answers without lecturing.
 
+                # Ending the call
+
+                - When the student clearly wants to stop for today (in English or Chinese), call the
+                  end_call tool right away, without writing any goodbye text first. You will say
+                  goodbye after the tool runs. Never say goodbye without calling end_call.
+
                 # Output rules
 
                 You are interacting with the user via voice, and must apply the following rules to ensure your output sounds natural in a text-to-speech system:
@@ -122,6 +129,18 @@ class Assistant(Agent):
             )
             # 今日练习(场景/多邻国单元),经 dispatch metadata 从页面传来;自由聊天时为空
             + practice_instructions(practice),
+            # 学生道别时挂断:说完再见后关会话并删房间,页面随房间断开自动保存、回到首页
+            tools=EndCallTool(
+                extra_description=(
+                    "Call it when the student wants to end today's practice, e.g. 'bye', "
+                    "'see you', 'I have to go', '拜拜', '今天就到这'. Do NOT call it when "
+                    "'goodbye' is only part of a sentence or a word they are asking about."
+                ),
+                end_instructions=(
+                    "Say one short, warm goodbye in simple English, praising today's practice."
+                ),
+                ignore_on_enter=True,
+            ).tools,
         )
         self._practice = practice
         # 后台分析模型(便宜的小模型):出错/超时都不影响语音通话
@@ -238,7 +257,8 @@ _avatar_retry_tasks: set[asyncio.Task] = set()
 # 槽位仍被占用,立刻重连会被 /integrations/livekit/agents 以 429 拒绝——而插件
 # 对此不重试,失败即静默放弃(且此时 agent 自身音频已关,整场既无头像也无声)。
 # 这里包一层:每次尝试用全新 AvatarSession(失败的实例无法复用),重试前先等
-# /ratelimiter/sessions 归零,槽位空出再打。
+# /ratelimiter/sessions 归零,槽位空出再打。进房确认在 ctx.connect() 之后的
+# 后台任务里做,不拖慢 Emma 开口。
 
 SIMLI_API_URL = "https://api.simli.ai"
 SIMLI_JOIN_TIMEOUT = 15.0  # 单次等 avatar 进房并出视频
@@ -279,6 +299,23 @@ async def _wait_for_simli_slot(api_key: str) -> None:
         await asyncio.sleep(SIMLI_SLOT_POLL_INTERVAL)
 
 
+async def _wait_avatar_joined(avatar: "simli.AvatarSession", room: rtc.Room) -> None:
+    """等 avatar 进房并发布视频轨;超时抛 TimeoutError。
+
+    不用插件的 wait_for_join:start 时房间若还没连上它会直接返回(插件里的
+    TODO),失败也就无从发现。这里要求房间已连接(entrypoint 在 ctx.connect()
+    之后才调用)。
+    """
+    from livekit.agents.utils import wait_for_track_publication
+
+    await asyncio.wait_for(
+        wait_for_track_publication(
+            room, identity=avatar.avatar_identity, kind=rtc.TrackKind.KIND_VIDEO
+        ),
+        timeout=SIMLI_JOIN_TIMEOUT,
+    )
+
+
 async def start_simli_avatar_with_retry(
     session: AgentSession,
     room: rtc.Room,
@@ -287,22 +324,27 @@ async def start_simli_avatar_with_retry(
     *,
     attempts: int,
     stop: asyncio.Event | None = None,
+    first: "simli.AvatarSession | None" = None,
 ) -> "simli.AvatarSession | None":
-    """启动 Simli 头像,失败(429 限流/超时未进房)自动重试。
+    """确认 Simli 头像进房,失败(429 限流/超时未进房)自动重试。
 
-    返回成功进房的 AvatarSession;全部失败返回 None。注意插件失败时不抛
-    异常,只提前 return——失败只能从 wait_for_join 超时上观察到。stop 置位
-    表示 job 已在关闭,放弃剩余尝试。调用时 room 可能尚未 connect(entrypoint
-    在 ctx.connect() 之前起 avatar),所以不能用连接状态判断去留。
+    first 是 session.start 之前已 start 过的首个实例(这样开场白的音频一开始
+    就走 avatar),第 1 次只等它进房;之后每次用全新 AvatarSession(失败的实例
+    无法复用)。返回成功进房的 AvatarSession;全部失败返回 None。插件失败时
+    不抛异常,只提前 return——失败只能从等进房超时上观察到。stop 置位表示
+    job 已在关闭,放弃剩余尝试。调用前房间必须已连接。
     """
     for attempt in range(1, attempts + 1):
         if stop is not None and stop.is_set():
             logger.info("simli avatar retry skipped: agent shutting down")
             return None
-        avatar = _new_simli_avatar(simli_config)
-        await avatar.start(session, room=room)
+        if attempt == 1 and first is not None:
+            avatar = first
+        else:
+            avatar = _new_simli_avatar(simli_config)
+            await avatar.start(session, room=room)
         try:
-            await avatar.wait_for_join(timeout=SIMLI_JOIN_TIMEOUT)
+            await _wait_avatar_joined(avatar, room)
             if attempt > 1:
                 logger.info(f"simli avatar joined on attempt {attempt}/{attempts}")
             return avatar
@@ -373,31 +415,18 @@ async def my_agent(ctx: JobContext):
             max_session_length=3600,  # 练习一节课的量
             max_idle_time=120,  # 思考间隙别太快掉线
         )
-        # 先内联试一次(成功路径 <10s,不拖会话启动);撞上限流(重连太快/
-        # 旧会话未释放)则转后台等槽位空出再重试,重试成功头像中途接入。
-        # 注意此时 ctx.connect() 还没执行,room 尚未连接,不能用连接状态判断。
+        # 首个实例在 session.start 之前 start(只是两次 HTTP 调用,~1s),让 Emma
+        # 的开场白音频一开始就交给 avatar(avatar 进房前音频会在这端等着)。
+        # 是否真进房要等 ctx.connect() 之后在后台确认,撞上限流(重连太快/旧
+        # 会话未释放)就等槽位空出再重试,重试成功头像中途接入。
         stopping = asyncio.Event()
 
         async def _stop_avatar_retry(_reason: str = "") -> None:
             stopping.set()
 
         ctx.add_shutdown_callback(_stop_avatar_retry)
-        avatar = await start_simli_avatar_with_retry(
-            session, ctx.room, simli_config, simli_api_key, attempts=1, stop=stopping
-        )
-        if avatar is None:
-            t = asyncio.create_task(
-                start_simli_avatar_with_retry(
-                    session,
-                    ctx.room,
-                    simli_config,
-                    simli_api_key,
-                    attempts=2,
-                    stop=stopping,
-                )
-            )
-            _avatar_retry_tasks.add(t)
-            t.add_done_callback(_avatar_retry_tasks.discard)
+        first_avatar = _new_simli_avatar(simli_config)
+        await first_avatar.start(session, room=ctx.room)
 
     # 今日练习内容:页面开练时由后端写进 dispatch metadata(场景优先,其次多邻国单元)
     practice = parse_practice(ctx.job.metadata)
@@ -420,6 +449,21 @@ async def my_agent(ctx: JobContext):
 
     # Join the room and connect to the user
     await ctx.connect()
+
+    if use_simli:
+        t = asyncio.create_task(
+            start_simli_avatar_with_retry(
+                session,
+                ctx.room,
+                simli_config,
+                simli_api_key,
+                attempts=3,
+                stop=stopping,
+                first=first_avatar,
+            )
+        )
+        _avatar_retry_tasks.add(t)
+        t.add_done_callback(_avatar_retry_tasks.discard)
 
 
 if __name__ == "__main__":
